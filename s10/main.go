@@ -1,0 +1,964 @@
+// =============================================================================
+// # s10: Team Protocols (团队协议)
+
+// `s01 > s02 > s03 > s04 > s05 > s06 | s07 > s08 > s09 > [ s10 ] s11 > s12`
+
+// > *"队友之间要有统一的沟通规矩"* -- 一个 request-response 模式驱动所有协商。
+// >
+// > **Harness 层**: 协议 -- 模型之间的结构化握手。
+
+// ## 问题
+
+// s09 中队友能干活能通信, 但缺少结构化协调:
+
+// **关机**: 直接杀线程会留下写了一半的文件和过期的 config.json。需要握手 -- 领导请求, 队友批准 (收尾退出) 或拒绝 (继续干)。
+
+// **计划审批**: 领导说 "重构认证模块", 队友立刻开干。高风险变更应该先过审。
+
+// 两者结构一样: 一方发带唯一 ID 的请求, 另一方引用同一 ID 响应。
+
+// ## 解决方案
+
+// ```
+// Shutdown Protocol            Plan Approval Protocol
+// ==================           ======================
+
+// Lead             Teammate    Teammate           Lead
+//   |                 |           |                 |
+//   |--shutdown_req-->|           |--plan_req------>|
+//   | {req_id:"abc"}  |           | {req_id:"xyz"}  |
+//   |                 |           |                 |
+//   |<--shutdown_resp-|           |<--plan_resp-----|
+//   | {req_id:"abc",  |           | {req_id:"xyz",  |
+//   |  approve:true}  |           |  approve:true}  |
+
+// Shared FSM:
+//   [pending] --approve--> [approved]
+//   [pending] --reject---> [rejected]
+
+// Trackers:
+//   shutdown_requests = {req_id: {target, status}}
+//   plan_requests     = {req_id: {from, plan, status}}
+// ```
+
+// Key insight: "Same request_id correlation pattern, two domains."
+//试试这些 prompt (英文 prompt 对 LLM 效果更好, 也可以用中文):
+
+// 1. `Spawn alice as a coder. Then request her shutdown.`
+// 2. `List teammates to see alice's status after shutdown approval`
+// 3. `Spawn bob with a risky refactoring task. Review and reject his plan.`
+// 4. `Spawn charlie, have him submit a plan, then approve it.`
+// 5. 输入 `/team` 监控状态
+// =============================================================================
+
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+)
+
+// 全局配置变量
+var (
+	model          string                            // 模型ID
+	baseURL        string                            // API基础URL
+	apiKey         string                            // API密钥
+	authHeaderName string                            // 认证头名称
+	workdir, _     = os.Getwd()                      // 当前工作目录
+	teamDir        = filepath.Join(workdir, ".team") // 团队数据目录
+	inboxDir       = filepath.Join(teamDir, "inbox") // 收件箱目录
+	system         string                            // 系统提示词
+	validMsgTypes  = map[string]bool{                // 有效的消息类型映射表
+		"message":                true, // 普通消息
+		"broadcast":              true, // 广播消息
+		"shutdown_request":       true, // 关闭请求
+		"shutdown_response":      true, // 关闭响应
+		"plan_approval_response": true, // 计划审批响应
+	}
+)
+
+// 请求跟踪器
+// 用于跟踪关闭请求和计划审批请求的状态
+var (
+	shutdownRequests = make(map[string]map[string]string) // 关闭请求映射表
+	planRequests     = make(map[string]map[string]string) // 计划请求映射表
+	trackerLock      sync.Mutex                           // 互斥锁，确保并发安全
+)
+
+// loadEnv loads .env file environment variables
+// This function reads environment variables from the project root .env file and sets them in the system
+// Only sets environment variables when they don't exist, avoiding overwriting existing system variables
+func loadEnv() error {
+	// Get current working directory
+	workdir, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("failed to get working directory: %w", err)
+	}
+
+	// Search upward for project root directory (containing .env file)
+	projectRoot := workdir
+	for {
+		envPath := filepath.Join(projectRoot, ".env")
+		if _, err := os.Stat(envPath); err == nil {
+			// Found .env file, use current directory
+			break
+		}
+
+		// Move up to parent directory
+		parent := filepath.Dir(projectRoot)
+		if parent == projectRoot {
+			// Already reached root directory, stop searching
+			break
+		}
+		projectRoot = parent
+	}
+
+	// Build .env file path
+	envPath := filepath.Join(projectRoot, ".env")
+
+	// Check if .env file exists
+	if _, err := os.Stat(envPath); os.IsNotExist(err) {
+		fmt.Printf("Warning: .env file not found at %s, using system environment variables only\n", envPath)
+		return nil
+	}
+
+	// Open and read .env file
+	file, err := os.Open(envPath)
+	if err != nil {
+		return fmt.Errorf("failed to open .env file: %w", err)
+	}
+	defer file.Close()
+
+	// Read .env file line by line
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		// Skip empty lines and comment lines (starting with #)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Parse key-value pairs (format: KEY=VALUE)
+		if parts := strings.SplitN(line, "=", 2); len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			value := strings.TrimSpace(parts[1])
+
+			// Remove possible quotes and backticks
+			value = strings.Trim(value, "\"'`")
+			value = strings.TrimSpace(value)
+
+			// Only set environment variable when it doesn't exist
+			if os.Getenv(key) == "" {
+				os.Setenv(key, value)
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error reading .env file: %w", err)
+	}
+
+	fmt.Printf("Loaded environment variables from .env file\n")
+	return nil
+}
+
+// initConfig 初始化配置变量
+// 这个函数从环境变量中读取配置参数并初始化全局变量
+// 必须在 loadEnv() 函数之后调用
+func initConfig() {
+	model = os.Getenv("MODEL_ID")                    // 模型ID
+	baseURL = os.Getenv("OPENAI_BASE_URL")           // API基础URL
+	apiKey = os.Getenv("OPENAI_API_KEY")             // API密钥
+	authHeaderName = os.Getenv("OPENAI_AUTH_HEADER") // 认证头名称
+	// 初始化系统提示词，包含团队协作说明
+	system = fmt.Sprintf("You are a team lead at %s. Manage teammates with shutdown and plan approval protocols.", workdir)
+}
+
+// InboxMessage 收件箱消息结构体
+// 用于团队成员之间的通信
+type InboxMessage struct {
+	Type      string      `json:"type"`            // 消息类型
+	From      string      `json:"from"`            // 发送者
+	Content   string      `json:"content"`         // 消息内容
+	Timestamp float64     `json:"timestamp"`       // 消息时间戳
+	Extra     interface{} `json:"extra,omitempty"` // 额外数据（可选）
+}
+
+// MessageBus 消息总线
+// 负责处理团队成员之间的收件箱通信
+type MessageBus struct {
+	dir string     // 收件箱目录路径
+	mu  sync.Mutex // 互斥锁，确保并发安全
+}
+
+// NewMessageBus 创建新的消息总线
+// 初始化消息总线并创建必要的目录结构
+func NewMessageBus(inboxDir string) *MessageBus {
+	// 创建收件箱目录
+	_ = os.MkdirAll(inboxDir, 0755)
+	return &MessageBus{dir: inboxDir}
+}
+
+// Send 发送消息到指定收件箱
+// 将消息写入目标收件箱的文件中
+func (bus *MessageBus) Send(sender, to, content, msgType string, extra interface{}) (string, error) {
+	// 验证消息类型是否有效
+	if !validMsgTypes[msgType] {
+		return "", fmt.Errorf("invalid message type: %s", msgType)
+	}
+
+	// 创建消息对象
+	msg := InboxMessage{
+		Type:      msgType,
+		From:      sender,
+		Content:   content,
+		Timestamp: float64(time.Now().UnixNano()) / 1e9,
+		Extra:     extra,
+	}
+
+	// 序列化消息为JSON
+	inboxPath := filepath.Join(bus.dir, fmt.Sprintf("%s.jsonl", to))
+	bus.mu.Lock()
+	defer bus.mu.Unlock()
+
+	f, err := os.OpenFile(inboxPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	// 将消息编码为JSON并写入文件
+	json.NewEncoder(f).Encode(msg)
+	return fmt.Sprintf("Sent %s to %s", msgType, to), nil
+}
+
+// ReadInbox 读取指定用户的收件箱
+// 返回所有未读消息并清空收件箱
+func (bus *MessageBus) ReadInbox(name string) ([]InboxMessage, error) {
+	// 构建收件箱文件路径
+	inboxPath := filepath.Join(bus.dir, fmt.Sprintf("%s.jsonl", name))
+	bus.mu.Lock()
+	defer bus.mu.Unlock()
+
+	// 检查收件箱文件是否存在
+	if _, err := os.Stat(inboxPath); os.IsNotExist(err) {
+		return nil, nil // 没有收件箱则返回空消息列表
+	}
+
+	// 读取收件箱文件内容
+	content, err := os.ReadFile(inboxPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// 解析JSONL格式的消息文件
+	var messages []InboxMessage
+	for _, line := range strings.Split(string(content), "\n") {
+		if line != "" {
+			var msg InboxMessage
+			// 解析每一行的JSON消息
+			if err := json.Unmarshal([]byte(line), &msg); err == nil {
+				messages = append(messages, msg)
+			}
+		}
+	}
+
+	// 清空收件箱文件，避免重复读取
+	_ = os.WriteFile(inboxPath, []byte(""), 0644)
+
+	return messages, nil
+}
+
+// Broadcast 广播消息给所有团队成员
+// 除了发送者之外的所有成员都会收到广播消息
+func (bus *MessageBus) Broadcast(sender, content string, teammates []string) (string, error) {
+	count := 0 // 记录广播成功的成员数量
+	for _, name := range teammates {
+		// 跳过发送者自己
+		if name != sender {
+			bus.Send(sender, name, content, "broadcast", nil)
+			count++
+		}
+	}
+	return fmt.Sprintf("Broadcast to %d teammates", count), nil
+}
+
+// 全局消息总线实例
+var bus = NewMessageBus(inboxDir)
+
+// 团队成员和团队管理器结构体
+
+// Teammate 团队成员结构体
+// 定义团队成员的基本信息和状态
+type Teammate struct {
+	Name   string `json:"name"`   // 成员名称
+	Role   string `json:"role"`   // 成员角色
+	Status string `json:"status"` // 成员状态
+}
+
+// TeamConfig 团队配置结构体
+type TeamConfig struct {
+	TeamName string     `json:"team_name"` // 团队名称
+	Members  []Teammate `json:"members"`   // 团队成员列表
+}
+
+// TeammateManager 团队成员管理器
+// 负责管理团队成员的创建、通信和生命周期
+type TeammateManager struct {
+	dir        string               // 团队目录路径
+	configPath string               // 配置文件路径
+	config     *TeamConfig          // 团队配置
+	threads    map[string]chan bool // 成员线程通信通道
+	mu         sync.Mutex           // 互斥锁，确保并发安全
+}
+
+// NewTeammateManager 创建新的团队成员管理器
+// 初始化管理器并加载团队配置
+func NewTeammateManager(teamDir string) *TeammateManager {
+	_ = os.MkdirAll(teamDir, 0755)
+	tm := &TeammateManager{
+		dir:        teamDir,
+		configPath: filepath.Join(teamDir, "config.json"),
+		threads:    make(map[string]chan bool),
+	}
+	tm.loadConfig()
+	return tm
+}
+
+// loadConfig 加载团队配置文件
+// 从JSON文件中读取团队配置信息
+func (tm *TeammateManager) loadConfig() {
+	if _, err := os.Stat(tm.configPath); os.IsNotExist(err) {
+		tm.config = &TeamConfig{TeamName: "default", Members: []Teammate{}}
+		tm.saveConfig()
+		return
+	}
+	content, _ := os.ReadFile(tm.configPath)
+	json.Unmarshal(content, &tm.config)
+}
+
+func (tm *TeammateManager) saveConfig() {
+	content, _ := json.MarshalIndent(tm.config, "", "  ")
+	os.WriteFile(tm.configPath, content, 0644)
+}
+
+func (tm *TeammateManager) findMember(name string) *Teammate {
+	for i, m := range tm.config.Members {
+		if m.Name == name {
+			return &tm.config.Members[i]
+		}
+	}
+	return nil
+}
+
+func (tm *TeammateManager) Spawn(name, role, prompt string) string {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	member := tm.findMember(name)
+	if member != nil {
+		if member.Status != "idle" && member.Status != "shutdown" {
+			return fmt.Sprintf("Error: '%s' is currently %s", name, member.Status)
+		}
+		member.Status = "working"
+		member.Role = role
+	} else {
+		tm.config.Members = append(tm.config.Members, Teammate{Name: name, Role: role, Status: "working"})
+	}
+	tm.saveConfig()
+
+	stopChan := make(chan bool)
+	tm.threads[name] = stopChan
+
+	go tm.teammateLoop(name, role, prompt, stopChan)
+
+	return fmt.Sprintf("Spawned '%s' (role: %s)", name, role)
+}
+
+func (tm *TeammateManager) teammateLoop(name, role, prompt string, stopChan chan bool) {
+	sysPrompt := fmt.Sprintf("You are '%s', role: %s, at %s. Submit plans via plan_approval. Respond to shutdown_request.", name, role, workdir)
+	messages := []Message{{Role: "user", Content: prompt}}
+	messages = append([]Message{{Role: "system", Content: sysPrompt}}, messages...)
+
+	shouldExit := false
+	for i := 0; i < 50; i++ {
+		select {
+		case <-stopChan:
+			return
+		default:
+		}
+
+		inbox, _ := bus.ReadInbox(name)
+		for _, msg := range inbox {
+			content, _ := json.Marshal(msg)
+			messages = append(messages, Message{Role: "user", Content: string(content)})
+		}
+
+		if shouldExit {
+			break
+		}
+
+		msg, err := chatCompletionsCreate(messages, teammateTools())
+		if err != nil {
+			log.Printf("[%s] Error calling API: %v", name, err)
+			break
+		}
+
+		messages = append(messages, msg)
+
+		if len(msg.ToolCalls) == 0 {
+			break
+		}
+
+		for _, tc := range msg.ToolCalls {
+			toolName := tc.Function.Name
+			var args map[string]interface{}
+			json.Unmarshal([]byte(tc.Function.Arguments), &args)
+
+			output := tm.exec(name, toolName, args)
+			fmt.Printf("  [%s] %s: %s\n", name, toolName, output)
+			if toolName == "shutdown_response" && args["approve"].(bool) {
+				shouldExit = true
+			}
+			messages = append(messages, Message{Role: "tool", ToolCallID: tc.ID, Content: output})
+		}
+	}
+
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	member := tm.findMember(name)
+	if member != nil {
+		member.Status = "shutdown"
+		tm.saveConfig()
+	}
+}
+
+func (tm *TeammateManager) exec(sender, toolName string, args map[string]interface{}) string {
+	switch toolName {
+	case "bash":
+		return runBash(args["command"].(string))
+	case "read_file":
+		var limit *int
+		if l, ok := args["limit"].(float64); ok {
+			val := int(l)
+			limit = &val
+		}
+		return runRead(args["path"].(string), limit)
+	case "write_file":
+		return runWrite(args["path"].(string), args["content"].(string))
+	case "edit_file":
+		return runEdit(args["path"].(string), args["old_text"].(string), args["new_text"].(string))
+	case "send_message":
+		to, _ := args["to"].(string)
+		content, _ := args["content"].(string)
+		msgType, _ := args["msg_type"].(string)
+		if msgType == "" {
+			msgType = "message"
+		}
+		result, _ := bus.Send(sender, to, content, msgType, nil)
+		return result
+	case "read_inbox":
+		inbox, _ := bus.ReadInbox(sender)
+		result, _ := json.MarshalIndent(inbox, "", "  ")
+		return string(result)
+	case "shutdown_response":
+		reqID := args["request_id"].(string)
+		approve := args["approve"].(bool)
+		trackerLock.Lock()
+		if req, ok := shutdownRequests[reqID]; ok {
+			if approve {
+				req["status"] = "approved"
+			} else {
+				req["status"] = "rejected"
+			}
+		}
+		trackerLock.Unlock()
+		bus.Send(sender, "lead", args["reason"].(string), "shutdown_response", map[string]interface{}{"request_id": reqID, "approve": approve})
+		if approve {
+			return "Shutdown approved"
+		}
+		return "Shutdown rejected"
+	case "plan_approval":
+		planText := args["plan"].(string)
+		// 使用时间戳生成唯一ID，避免外部依赖
+		reqID := fmt.Sprintf("%d", time.Now().UnixNano())[:8]
+		trackerLock.Lock()
+		planRequests[reqID] = map[string]string{"from": sender, "plan": planText, "status": "pending"}
+		trackerLock.Unlock()
+		bus.Send(sender, "lead", planText, "plan_approval_response", map[string]interface{}{"request_id": reqID, "plan": planText})
+		return fmt.Sprintf("Plan submitted (request_id=%s). Waiting for lead approval.", reqID)
+	default:
+		return fmt.Sprintf("Unknown tool: %s", toolName)
+	}
+}
+
+func (tm *TeammateManager) ListAll() string {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	if len(tm.config.Members) == 0 {
+		return "No teammates."
+	}
+	var lines []string
+	lines = append(lines, fmt.Sprintf("Team: %s", tm.config.TeamName))
+	for _, m := range tm.config.Members {
+		lines = append(lines, fmt.Sprintf("  %s (%s): %s", m.Name, m.Role, m.Status))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (tm *TeammateManager) MemberNames() []string {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	var names []string
+	for _, m := range tm.config.Members {
+		names = append(names, m.Name)
+	}
+	return names
+}
+
+var team = NewTeammateManager(teamDir)
+
+// Lead-specific protocol handlers
+func handleShutdownRequest(teammate string) string {
+	// 使用时间戳生成唯一ID，避免外部依赖
+	reqID := fmt.Sprintf("%d", time.Now().UnixNano())[:8]
+	trackerLock.Lock()
+	shutdownRequests[reqID] = map[string]string{"target": teammate, "status": "pending"}
+	trackerLock.Unlock()
+	bus.Send("lead", teammate, "Please shut down gracefully.", "shutdown_request", map[string]interface{}{"request_id": reqID})
+	return fmt.Sprintf("Shutdown request %s sent to '%s' (status: pending)", reqID, teammate)
+}
+
+func handlePlanReview(reqID string, approve bool, feedback string) string {
+	trackerLock.Lock()
+	defer trackerLock.Unlock()
+
+	req, ok := planRequests[reqID]
+	if !ok {
+		return fmt.Sprintf("Error: Unknown plan request_id '%s'", reqID)
+	}
+	if approve {
+		req["status"] = "approved"
+	} else {
+		req["status"] = "rejected"
+	}
+	bus.Send("lead", req["from"], feedback, "plan_approval_response", map[string]interface{}{"request_id": reqID, "approve": approve, "feedback": feedback})
+	return fmt.Sprintf("Plan %s for '%s'", req["status"], req["from"])
+}
+
+func checkShutdownStatus(reqID string) string {
+	trackerLock.Lock()
+	defer trackerLock.Unlock()
+
+	req, ok := shutdownRequests[reqID]
+	if !ok {
+		return `{"error": "not found"}`
+	}
+	result, _ := json.Marshal(req)
+	return string(result)
+}
+
+// Base tool implementations and OpenAI structs are omitted for brevity.
+
+// Tool handlers for the lead agent
+var toolHandlers = map[string]interface{}{
+	"bash": func(args map[string]interface{}) string { return runBash(args["command"].(string)) },
+	"read_file": func(args map[string]interface{}) string {
+		var limit *int
+		if l, ok := args["limit"].(float64); ok {
+			val := int(l)
+			limit = &val
+		}
+		return runRead(args["path"].(string), limit)
+	},
+	"write_file": func(args map[string]interface{}) string {
+		return runWrite(args["path"].(string), args["content"].(string))
+	},
+	"edit_file": func(args map[string]interface{}) string {
+		return runEdit(args["path"].(string), args["old_text"].(string), args["new_text"].(string))
+	},
+	"spawn_teammate": func(args map[string]interface{}) string {
+		return team.Spawn(args["name"].(string), args["role"].(string), args["prompt"].(string))
+	},
+	"list_teammates": func(args map[string]interface{}) string { return team.ListAll() },
+	"send_message": func(args map[string]interface{}) string {
+		to, _ := args["to"].(string)
+		content, _ := args["content"].(string)
+		msgType, _ := args["msg_type"].(string)
+		if msgType == "" {
+			msgType = "message"
+		}
+		result, _ := bus.Send("lead", to, content, msgType, nil)
+		return result
+	},
+	"read_inbox": func(args map[string]interface{}) string {
+		inbox, _ := bus.ReadInbox("lead")
+		result, _ := json.MarshalIndent(inbox, "", "  ")
+		return string(result)
+	},
+	"broadcast": func(args map[string]interface{}) string {
+		content := args["content"].(string)
+		teammates := team.MemberNames()
+		result, _ := bus.Broadcast("lead", content, teammates)
+		return result
+	},
+	"shutdown_request":  func(args map[string]interface{}) string { return handleShutdownRequest(args["teammate"].(string)) },
+	"shutdown_response": func(args map[string]interface{}) string { return checkShutdownStatus(args["request_id"].(string)) },
+	"plan_approval": func(args map[string]interface{}) string {
+		return handlePlanReview(args["request_id"].(string), args["approve"].(bool), args["feedback"].(string))
+	},
+}
+
+func agentLoop(messages *[]Message) {
+	// Add system message if not present
+	if len(*messages) == 0 {
+		*messages = append(*messages, Message{Role: "system", Content: system})
+	}
+
+	for {
+		msg, err := chatCompletionsCreate(*messages, leadTools())
+		if err != nil {
+			log.Printf("Error calling API: %v", err)
+			return
+		}
+
+		*messages = append(*messages, msg)
+
+		if len(msg.ToolCalls) == 0 {
+			if msg.Content != "" {
+				fmt.Println(msg.Content)
+			}
+			return
+		}
+
+		for _, tc := range msg.ToolCalls {
+			name := tc.Function.Name
+			var args map[string]interface{}
+			json.Unmarshal([]byte(tc.Function.Arguments), &args)
+
+			handler, ok := toolHandlers[name]
+			var output string
+			if ok {
+				output = handler.(func(map[string]interface{}) string)(args)
+			} else {
+				output = fmt.Sprintf("Unknown tool: %s", name)
+			}
+
+			if len(output) > 200 {
+				fmt.Printf(">✌️ 执行命令:%s \n ✌️ 参数:%+v \n ✌️ 结果:%s...✌️\n\n\n", name, args, output[:200])
+			} else {
+				fmt.Printf(">✌️ 执行命令:%s \n ✌️ 参数:%+v \n ✌️ 结果:%s ✌️\n\n\n", name, args, output)
+			}
+
+			*messages = append(*messages, Message{
+				Role:       "tool",
+				ToolCallID: tc.ID,
+				Content:    output,
+			})
+		}
+	}
+}
+
+// NOTE: The following are placeholder functions and structs.
+// You should replace them with the full implementations from s09.
+
+type Message struct {
+	Role       string     `json:"role"`
+	Content    string     `json:"content,omitempty"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+}
+type ToolCall struct {
+	ID       string           `json:"id"`
+	Type     string           `json:"type"`
+	Function ToolCallFunction `json:"function"`
+}
+type ToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+type Tool struct {
+	Type     string      `json:"type"`
+	Function FunctionDef `json:"function"`
+}
+type FunctionDef struct {
+	Name        string      `json:"name"`
+	Description string      `json:"description"`
+	Parameters  interface{} `json:"parameters"`
+}
+type ChatCompletionRequest struct {
+	Model       string    `json:"model"`
+	Messages    []Message `json:"messages"`
+	Tools       []Tool    `json:"tools"`
+	ToolChoice  string    `json:"tool_choice"`
+	Temperature float64   `json:"temperature"`
+}
+type ChatCompletionResponse struct {
+	Choices []struct {
+		Message Message `json:"message"`
+	} `json:"choices"`
+}
+
+func runBash(command string) string {
+	dangerous := []string{"rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"}
+	for _, d := range dangerous {
+		if strings.Contains(command, d) {
+			return "Error: Dangerous command blocked"
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sh", "-c", command)
+	cmd.Dir = workdir
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+
+	err := cmd.Run()
+	output := out.String()
+
+	if ctx.Err() == context.DeadlineExceeded {
+		return "Error: Timeout (120s)"
+	}
+	if err != nil {
+		return fmt.Sprintf("Error: %v\nOutput:\n%s", err, output)
+	}
+
+	if len(output) > 50000 {
+		output = output[:50000]
+	}
+	if output == "" {
+		return "(no output)"
+	}
+	return output
+}
+
+func runRead(path string, limit *int) string {
+	fp, err := safePath(path)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err)
+	}
+	content, err := os.ReadFile(fp)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err)
+	}
+	lines := strings.Split(string(content), "\n")
+	if limit != nil && *limit < len(lines) {
+		limitedLines := lines[:*limit]
+		limitedLines = append(limitedLines, fmt.Sprintf("... (%d more lines)", len(lines)-*limit))
+		result := strings.Join(limitedLines, "\n")
+		if len(result) > 50000 {
+			return result[:50000]
+		}
+		return result
+	}
+	result := strings.Join(lines, "\n")
+	if len(result) > 50000 {
+		return result[:50000]
+	}
+	return result
+}
+
+func runWrite(path, content string) string {
+	fp, err := safePath(path)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err)
+	}
+	err = os.MkdirAll(filepath.Dir(fp), 0755)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err)
+	}
+	err = os.WriteFile(fp, []byte(content), 0644)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err)
+	}
+	return fmt.Sprintf("Wrote %d bytes to %s", len(content), path)
+}
+
+func runEdit(path, oldText, newText string) string {
+	fp, err := safePath(path)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err)
+	}
+	content, err := os.ReadFile(fp)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err)
+	}
+	if !strings.Contains(string(content), oldText) {
+		return fmt.Sprintf("Error: Text not found in %s", path)
+	}
+	newContent := strings.Replace(string(content), oldText, newText, 1)
+	err = os.WriteFile(fp, []byte(newContent), 0644)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err)
+	}
+	return fmt.Sprintf("Edited %s", path)
+}
+
+func safePath(p string) (string, error) {
+	workdirAbs, err := filepath.Abs(workdir)
+	if err != nil {
+		return "", err
+	}
+
+	absPath, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+
+	if !strings.HasPrefix(absPath, workdirAbs) {
+		return "", fmt.Errorf("path escapes workspace: %s", p)
+	}
+
+	return absPath, nil
+}
+
+func chatCompletionsCreate(messages []Message, tools []Tool) (Message, error) {
+	header := http.Header{}
+	authHeader := authHeaderName
+	if authHeader == "" {
+		authHeader = "Authorization"
+	}
+	header.Set(authHeader, "Bearer "+apiKey)
+	header.Set("Content-Type", "application/json")
+
+	payload := ChatCompletionRequest{
+		Model:       model,
+		Messages:    messages,
+		Tools:       tools,
+		ToolChoice:  "auto",
+		Temperature: 0,
+	}
+
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return Message{}, fmt.Errorf("failed to marshal payload: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", baseURL, bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		return Message{}, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header = header
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return Message{}, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return Message{}, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var response ChatCompletionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return Message{}, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	if len(response.Choices) == 0 {
+		return Message{}, fmt.Errorf("no choices in response")
+	}
+
+	return response.Choices[0].Message, nil
+}
+
+func teammateTools() []Tool {
+	return []Tool{
+		{Type: "function", Function: FunctionDef{Name: "bash", Description: "Run a shell command.", Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{"command": map[string]string{"type": "string"}}, "required": []string{"command"}}}},
+		{Type: "function", Function: FunctionDef{Name: "read_file", Description: "Read file contents.", Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{"path": map[string]string{"type": "string"}, "limit": map[string]interface{}{"type": "integer"}}, "required": []string{"path"}}}},
+		{Type: "function", Function: FunctionDef{Name: "write_file", Description: "Write content to file.", Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{"path": map[string]string{"type": "string"}, "content": map[string]string{"type": "string"}}, "required": []string{"path", "content"}}}},
+		{Type: "function", Function: FunctionDef{Name: "edit_file", Description: "Replace exact text in file.", Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{"path": map[string]string{"type": "string"}, "old_text": map[string]string{"type": "string"}, "new_text": map[string]string{"type": "string"}}, "required": []string{"path", "old_text", "new_text"}}}},
+		{Type: "function", Function: FunctionDef{Name: "send_message", Description: "Send message to a teammate.", Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{"to": map[string]string{"type": "string"}, "content": map[string]string{"type": "string"}, "msg_type": map[string]interface{}{"type": "string", "enum": []string{"message", "broadcast", "shutdown_request", "shutdown_response", "plan_approval_response"}}}, "required": []string{"to", "content"}}}},
+		{Type: "function", Function: FunctionDef{Name: "read_inbox", Description: "Read and drain your inbox.", Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}}},
+		{Type: "function", Function: FunctionDef{Name: "shutdown_response", Description: "Respond to a shutdown request.", Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{"request_id": map[string]string{"type": "string"}, "approve": map[string]interface{}{"type": "boolean"}, "reason": map[string]string{"type": "string"}}, "required": []string{"request_id", "approve"}}}},
+		{Type: "function", Function: FunctionDef{Name: "plan_approval", Description: "Submit a plan for lead approval.", Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{"plan": map[string]string{"type": "string"}}, "required": []string{"plan"}}}},
+	}
+}
+
+func leadTools() []Tool {
+	return []Tool{
+		{Type: "function", Function: FunctionDef{Name: "bash", Description: "Run a shell command.", Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{"command": map[string]string{"type": "string"}}, "required": []string{"command"}}}},
+		{Type: "function", Function: FunctionDef{Name: "read_file", Description: "Read file contents.", Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{"path": map[string]string{"type": "string"}, "limit": map[string]interface{}{"type": "integer"}}, "required": []string{"path"}}}},
+		{Type: "function", Function: FunctionDef{Name: "write_file", Description: "Write content to file.", Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{"path": map[string]string{"type": "string"}, "content": map[string]string{"type": "string"}}, "required": []string{"path", "content"}}}},
+		{Type: "function", Function: FunctionDef{Name: "edit_file", Description: "Replace exact text in file.", Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{"path": map[string]string{"type": "string"}, "old_text": map[string]string{"type": "string"}, "new_text": map[string]string{"type": "string"}}, "required": []string{"path", "old_text", "new_text"}}}},
+		{Type: "function", Function: FunctionDef{Name: "spawn_teammate", Description: "Spawn a new teammate.", Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{"name": map[string]string{"type": "string"}, "role": map[string]string{"type": "string"}, "prompt": map[string]string{"type": "string"}}, "required": []string{"name", "role", "prompt"}}}},
+		{Type: "function", Function: FunctionDef{Name: "list_teammates", Description: "List all teammates.", Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}}},
+		{Type: "function", Function: FunctionDef{Name: "send_message", Description: "Send message to a teammate.", Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{"to": map[string]string{"type": "string"}, "content": map[string]string{"type": "string"}, "msg_type": map[string]interface{}{"type": "string", "enum": []string{"message", "broadcast", "shutdown_request", "shutdown_response", "plan_approval_response"}}}, "required": []string{"to", "content"}}}},
+		{Type: "function", Function: FunctionDef{Name: "read_inbox", Description: "Read and drain your inbox.", Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}}},
+		{Type: "function", Function: FunctionDef{Name: "broadcast", Description: "Broadcast message to all teammates.", Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{"content": map[string]string{"type": "string"}}, "required": []string{"content"}}}},
+		{Type: "function", Function: FunctionDef{Name: "shutdown_request", Description: "Request shutdown of a teammate.", Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{"teammate": map[string]string{"type": "string"}}, "required": []string{"teammate"}}}},
+		{Type: "function", Function: FunctionDef{Name: "shutdown_response", Description: "Check shutdown request status.", Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{"request_id": map[string]string{"type": "string"}}, "required": []string{"request_id"}}}},
+		{Type: "function", Function: FunctionDef{Name: "plan_approval", Description: "Approve or reject a plan.", Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{"request_id": map[string]string{"type": "string"}, "approve": map[string]interface{}{"type": "boolean"}, "feedback": map[string]string{"type": "string"}}, "required": []string{"request_id", "approve", "feedback"}}}},
+	}
+}
+
+func getValidMsgTypes() []string {
+	keys := make([]string, 0, len(validMsgTypes))
+	for k := range validMsgTypes {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func main() {
+	// 加载 .env 文件
+	if err := loadEnv(); err != nil {
+		fmt.Printf("Warning: Failed to load .env file: %v\n", err)
+	}
+
+	// 初始化配置变量
+	initConfig()
+
+	// 检查必需的环境变量
+	if model == "" || baseURL == "" || apiKey == "" {
+		fmt.Printf("Error: Ensure MODEL_ID, OPENAI_BASE_URL, and OPENAI_API_KEY environment variables are set.\n")
+		return
+	}
+
+	history := []Message{}
+	scanner := bufio.NewScanner(os.Stdin)
+	for {
+		fmt.Print("\033[36ms10 >> \033[0m")
+		if !scanner.Scan() {
+			break
+		}
+		query := scanner.Text()
+		if strings.TrimSpace(strings.ToLower(query)) == "q" || strings.TrimSpace(strings.ToLower(query)) == "exit" || query == "" {
+			break
+		}
+
+		if strings.TrimSpace(query) == "/team" {
+			fmt.Println(team.ListAll())
+			continue
+		}
+		if strings.TrimSpace(query) == "/inbox" {
+			inbox, _ := bus.ReadInbox("lead")
+			result, _ := json.MarshalIndent(inbox, "", "  ")
+			fmt.Println(string(result))
+			continue
+		}
+
+		history = append(history, Message{Role: "user", Content: query})
+		agentLoop(&history)
+		fmt.Println()
+	}
+}

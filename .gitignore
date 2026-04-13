@@ -1,0 +1,45 @@
+# 环境变量文件
+.env
+
+# 编译产物
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+s01/s01
+s02/s02
+s03/s03
+s04/s04
+s05/s05
+s06/s06
+s07/s07
+s08/s08
+s09/s09
+s10/s10
+s11/s11
+s12/s12
+
+# 测试文件
+*.test
+
+# 日志文件
+*.log
+
+# 临时文件
+*.tmp
+*.temp
+
+# IDE 文件
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# 技能目录中的敏感文件（如果包含）
+skills/*.key
+skills/*.secret
+**/secrets/
