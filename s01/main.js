@@ -13,7 +13,7 @@ const execPromise = promisify(exec);
 // ====================== 直接写死配置（简化版）======================
 const MODEL_ID = "deepseek-chat";
 const OPENAI_BASE_URL = "https://ai.0532888.cn/openai/chat/completions";
-const OPENAI_API_KEY = "zane";
+const OPENAI_API_KEY = "**";
 // ==================================================================
 
 const WORK_DIR = process.cwd();
