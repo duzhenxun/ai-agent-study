@@ -2,18 +2,36 @@ import axios from 'axios';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import readline from 'readline';
+import { config } from 'dotenv';
+import { existsSync } from 'fs';
+
+// Load environment variables from .env file
+const envPath = './../.env'; // js 同级的 .env 文件
+if (existsSync(envPath)) {
+  config({ path: envPath });
+  console.log(`✅ 已加载环境变量文件: ${envPath}`);
+} else {
+  console.log(`⚠️  警告: 未找到 ${envPath} 文件，使用默认配置`);
+  console.log('💡 提示: 请复制 .env.example 为 .env 并填入你的 API 配置');
+}
 
 // 执行 exec 的 promise 版本
     // npm init -y
     // npm install axios
-    // node main.js
+    // node *.js
 
 const execPromise = promisify(exec);
 
-// ====================== 直接写死配置（简化版）======================
-const MODEL_ID = "deepseek-chat";
-const OPENAI_BASE_URL = "https://ai.0532888.cn/openai/chat/completions";
-const OPENAI_API_KEY = "**";
+// ====================== 从环境变量读取配置======================
+const MODEL_ID = process.env.MODEL_ID ;
+const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+
+// 调试：打印环境变量
+console.log('=== 调试信息 ===');
+console.log('MODEL_ID:', MODEL_ID);
+console.log('OPENAI_BASE_URL:', OPENAI_BASE_URL);
+console.log('OPENAI_API_KEY:', OPENAI_API_KEY ? '已设置' : '未设置');
 // ==================================================================
 
 const WORK_DIR = process.cwd();
