@@ -2,7 +2,7 @@
 
 `s01 > s02 > s03 > s04 > [ s05 ] s06 | s07 > s08 > s09 > s10 > s11 > s12`
 
-> *"用到什么知识, 临时加载什么知识"* -- 通过 tool_result 注入, 不塞 system prompt。
+> _"用到什么知识, 临时加载什么知识"_ -- 通过 tool_result 注入, 不塞 system prompt。
 >
 > **Harness 层**: 按需知识 -- 模型开口要时才给的领域专长。
 
@@ -35,6 +35,17 @@ When model calls load_skill("git"):
 
 ## 工作原理
 
+### 系统提示
+
+```
+You are a coding agent at %s.When executing scripts, If you need to use some scripts in the skill, Use load_skill to access specialized knowledge before tackling unfamiliar topics.
+
+Skills available:
+%s
+
+When executing scripts, you must include the skill name in the path:skill_name/scripts/xxx, you cannot omit the skill name.
+```
+
 1. 每个技能是一个目录, 包含 `SKILL.md` 文件和 YAML frontmatter。
 
 ```
@@ -47,40 +58,67 @@ skills/
 
 2. SkillLoader 递归扫描 `SKILL.md` 文件, 用目录名作为技能标识。
 
-```python
-class SkillLoader:
-    def __init__(self, skills_dir: Path):
-        self.skills = {}
-        for f in sorted(skills_dir.rglob("SKILL.md")):
-            text = f.read_text()
-            meta, body = self._parse_frontmatter(text)
-            name = meta.get("name", f.parent.name)
-            self.skills[name] = {"meta": meta, "body": body}
+```go
+// SkillLoader 技能加载器
+type SkillLoader struct {
+	skillsDir string           // 技能目录路径
+	skills    map[string]Skill // 已加载的技能映射表
+}
 
-    def get_descriptions(self) -> str:
-        lines = []
-        for name, skill in self.skills.items():
-            desc = skill["meta"].get("description", "")
-            lines.append(f"  - {name}: {desc}")
-        return "\n".join(lines)
+// Skill 表示一个技能，包含元数据、主体内容和路径信息
+type Skill struct {
+	Meta map[string]string // 技能元数据（名称、描述、参数等）
+	Body string            // 技能主体内容（通常是Markdown格式的说明）
+	Path string            // 技能文件路径
+}
 
-    def get_content(self, name: str) -> str:
-        skill = self.skills.get(name)
-        if not skill:
-            return f"Error: Unknown skill '{name}'."
-        return f"<skill name=\"{name}\">\n{skill['body']}\n</skill>"
+// NewSkillLoader 创建新的技能加载器
+// 初始化技能加载器并自动加载所有可用技能
+func NewSkillLoader(skillsDir string) *SkillLoader {
+	// 创建技能加载器实例
+	sl := &SkillLoader{
+		skillsDir: skillsDir,              // 设置技能目录
+		skills:    make(map[string]Skill), // 初始化技能映射表
+	}
+	// 自动加载所有技能
+	sl.loadAll()
+	return sl
+}
+
+// getDescriptions 获取所有技能的描述列表
+func (sl *SkillLoader) getDescriptions() string {
+	var lines []string
+	for name, skill := range sl.skills {
+		desc := skill.Meta["description"]
+		lines = append(lines, fmt.Sprintf("  - %s: %s", name, desc))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// getContent 获取指定技能的完整内容
+func (sl *SkillLoader) getContent(name string) string {
+	skill, ok := sl.skills[name]
+	if !ok {
+		return fmt.Sprintf("Error: Unknown skill '%s'", name)
+	}
+	return fmt.Sprintf("<skill name=\"%s\">%s</skill>", name, skill.Body)
+}
 ```
 
 3. 第一层写入系统提示。第二层不过是 dispatch map 中的又一个工具。
 
-```python
-SYSTEM = f"""You are a coding agent at {WORKDIR}.
-Skills available:
-{SKILL_LOADER.get_descriptions()}"""
+```go
+func initSystem() {
+	system = fmt.Sprintf("You are a coding agent at %s.\nSkills available:\n%s", workdir, skillLoader.getDescriptions())
+}
 
-TOOL_HANDLERS = {
-    # ...base tools...
-    "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
+// Tool Handlers Map
+var toolHandlers = map[string]interface{}{
+	// ...base tools...
+	"load_skill": func(args map[string]interface{}) string {
+		name := args["name"].(string)
+		return skillLoader.getContent(name)
+	},
 }
 ```
 
@@ -88,18 +126,18 @@ TOOL_HANDLERS = {
 
 ## 相对 s04 的变更
 
-| 组件           | 之前 (s04)       | 之后 (s05)                     |
-|----------------|------------------|--------------------------------|
-| Tools          | 5 (基础 + task)  | 5 (基础 + load_skill)          |
-| 系统提示       | 静态字符串       | + 技能描述列表                 |
-| 知识库         | 无               | skills/\*/SKILL.md 文件        |
-| 注入方式       | 无               | 两层 (系统提示 + result)       |
+| 组件     | 之前 (s04)      | 之后 (s05)               |
+| -------- | --------------- | ------------------------ |
+| Tools    | 5 (基础 + task) | 5 (基础 + load_skill)    |
+| 系统提示 | 静态字符串      | + 技能描述列表           |
+| 知识库   | 无              | skills/\*/SKILL.md 文件  |
+| 注入方式 | 无              | 两层 (系统提示 + result) |
 
 ## 试一试
 
 ```sh
-cd learn-claude-code
-python agents/s05_skill_loading.py
+cd ai-agent-study/s05
+go run main.go
 ```
 
 试试这些 prompt (英文 prompt 对 LLM 效果更好, 也可以用中文):

@@ -128,10 +128,6 @@ func loadEnv() error {
 			key := strings.TrimSpace(parts[0])
 			value := strings.TrimSpace(parts[1])
 
-			// 移除可能存在的引号和反引号
-			value = strings.Trim(value, "\"'`")
-			value = strings.TrimSpace(value)
-
 			// 只有当环境变量不存在时才设置
 			if os.Getenv(key) == "" {
 				os.Setenv(key, value)

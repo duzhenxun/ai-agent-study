@@ -2,7 +2,7 @@
 
 `s01 > s02 > s03 > s04 > s05 > s06 | s07 > s08 > s09 > [ s10 ] s11 > s12`
 
-> *"队友之间要有统一的沟通规矩"* -- 一个 request-response 模式驱动所有协商。
+> _"队友之间要有统一的沟通规矩"_ -- 一个 request-response 模式驱动所有协商。
 >
 > **Harness 层**: 协议 -- 模型之间的结构化握手。
 
@@ -42,61 +42,109 @@ Trackers:
 
 ## 工作原理
 
+### System Prompt
+
+```
+You are a team lead at %s. Manage teammates with shutdown and plan approval protocols.
+```
+
 1. 领导生成 request_id, 通过收件箱发起关机请求。
 
-```python
-shutdown_requests = {}
+```go
+// 请求跟踪器
+// 用于跟踪关闭请求和计划审批请求的状态
+var (
+	shutdownRequests = make(map[string]map[string]string) // 关闭请求映射表
+	planRequests     = make(map[string]map[string]string) // 计划请求映射表
+	trackerLock      sync.Mutex                           // 互斥锁，确保并发安全
+)
 
-def handle_shutdown_request(teammate: str) -> str:
-    req_id = str(uuid.uuid4())[:8]
-    shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
-    BUS.send("lead", teammate, "Please shut down gracefully.",
-             "shutdown_request", {"request_id": req_id})
-    return f"Shutdown request {req_id} sent (status: pending)"
+func handleShutdownRequest(teammate string) string {
+	trackerLock.Lock()
+	defer trackerLock.Unlock()
+
+	// 生成8位请求ID
+	reqID := fmt.Sprintf("%08d", time.Now().UnixNano()%100000000)
+	shutdownRequests[reqID] = map[string]string{
+		"target": teammate,
+		"status": "pending",
+	}
+
+	bus.Send("lead", teammate, "Please shut down gracefully.",
+		"shutdown_request", map[string]interface{}{"request_id": reqID})
+
+	return fmt.Sprintf("Shutdown request %s sent (status: pending)", reqID)
+}
 ```
 
 2. 队友收到请求后, 用 approve/reject 响应。
 
-```python
-if tool_name == "shutdown_response":
-    req_id = args["request_id"]
-    approve = args["approve"]
-    shutdown_requests[req_id]["status"] = "approved" if approve else "rejected"
-    BUS.send(sender, "lead", args.get("reason", ""),
-             "shutdown_response",
-             {"request_id": req_id, "approve": approve})
+```go
+if toolName == "shutdown_response" {
+	reqID := args["request_id"].(string)
+	approve := args["approve"].(bool)
+
+	trackerLock.Lock()
+	if req, exists := shutdownRequests[reqID]; exists {
+		if approve {
+			req["status"] = "approved"
+		} else {
+			req["status"] = "rejected"
+		}
+		shutdownRequests[reqID] = req
+	}
+	trackerLock.Unlock()
+
+	reason := ""
+	if r, ok := args["reason"]; ok {
+		reason = r.(string)
+	}
+
+	bus.Send(sender, "lead", reason,
+		"shutdown_response",
+		map[string]interface{}{"request_id": reqID, "approve": approve})
+}
 ```
 
 3. 计划审批遵循完全相同的模式。队友提交计划 (生成 request_id), 领导审查 (引用同一个 request_id)。
 
-```python
-plan_requests = {}
+```go
+func handlePlanReview(requestID string, approve bool, feedback string) {
+	trackerLock.Lock()
+	defer trackerLock.Unlock()
 
-def handle_plan_review(request_id, approve, feedback=""):
-    req = plan_requests[request_id]
-    req["status"] = "approved" if approve else "rejected"
-    BUS.send("lead", req["from"], feedback,
-             "plan_approval_response",
-             {"request_id": request_id, "approve": approve})
+	if req, exists := planRequests[requestID]; exists {
+		if approve {
+			req["status"] = "approved"
+		} else {
+			req["status"] = "rejected"
+		}
+		planRequests[requestID] = req
+
+		bus.Send("lead", req["from"], feedback,
+			"plan_approval_response",
+			map[string]interface{}{"request_id": requestID, "approve": approve})
+	}
+}
 ```
 
 一个 FSM, 两种用途。同样的 `pending -> approved | rejected` 状态机可以套用到任何请求-响应协议上。
 
 ## 相对 s09 的变更
 
-| 组件           | 之前 (s09)       | 之后 (s10)                           |
-|----------------|------------------|--------------------------------------|
-| Tools          | 9                | 12 (+shutdown_req/resp +plan)        |
-| 关机           | 仅自然退出       | 请求-响应握手                        |
-| 计划门控       | 无               | 提交/审查与审批                      |
-| 关联           | 无               | 每个请求一个 request_id              |
-| FSM            | 无               | pending -> approved/rejected         |
+| 组件     | 之前 (s09) | 之后 (s10)                    |
+| -------- | ---------- | ----------------------------- |
+| Tools    | 9          | 12 (+shutdown_req/resp +plan) |
+| 关机     | 仅自然退出 | 请求-响应握手                 |
+| 计划门控 | 无         | 提交/审查与审批               |
+| 关联     | 无         | 每个请求一个 request_id       |
+| FSM      | 无         | pending -> approved/rejected  |
 
 ## 试一试
 
 ```sh
-cd learn-claude-code
-python agents/s10_team_protocols.py
+cd ai-agent-study/s10
+go run main.go
 ```
 
 试试这些 prompt (英文 prompt 对 LLM 效果更好, 也可以用中文):

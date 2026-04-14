@@ -2,7 +2,7 @@
 
 `s01 > s02 > s03 > s04 > s05 > s06 | s07 > s08 > s09 > s10 > [ s11 ] s12`
 
-> *"队友自己看看板, 有活就认领"* -- 不需要领导逐个分配, 自组织。
+> _"队友自己看看板, 有活就认领"_ -- 不需要领导逐个分配, 自组织。
 >
 > **Harness 层**: 自治 -- 模型自己找活干, 无需指派。
 
@@ -46,93 +46,158 @@ Identity re-injection after compression:
 ```
 
 ## 工作原理
-
+#### System Prompt
+```
+You are a team lead at %s. Teammates are autonomous.
+```
 1. 队友循环分两个阶段: WORK 和 IDLE。LLM 停止调用工具 (或调用了 `idle`) 时, 进入 IDLE。
 
-```python
-def _loop(self, name, role, prompt):
-    while True:
-        # -- WORK PHASE --
-        messages = [{"role": "user", "content": prompt}]
-        for _ in range(50):
-            response = client.messages.create(...)
-            if response.stop_reason != "tool_use":
-                break
-            # execute tools...
-            if idle_requested:
-                break
+```go
+func (tm *TeammateManager) autonomousLoop(name, role, prompt string) {
+	messages := []Message{{Role: "user", Content: prompt}}
+	for {
+		// -- WORK PHASE --
+		for i := 0; i < 50; i++ {
+			// 身份重注入检查
+			if len(messages) <= 3 {
+				identityBlock := fmt.Sprintf("<identity>You are '%s', role: %s, team: my-team. Continue your work.</identity>", name, role)
+				messages = append([]Message{{Role: "user", Content: identityBlock}}, messages...)
+				messages = append([]Message{{Role: "assistant", Content: fmt.Sprintf("I am %s. Continuing.", name)}}, messages[1:]...)
+			}
 
-        # -- IDLE PHASE --
-        self._set_status(name, "idle")
-        resume = self._idle_poll(name, messages)
-        if not resume:
-            self._set_status(name, "shutdown")
-            return
-        self._set_status(name, "working")
+			msg, err := chatCompletionsCreate(messages, openAITools())
+			if err != nil {
+				log.Printf("Error in autonomous loop: %v", err)
+				break
+			}
+
+			messages = append(messages, msg)
+
+			if len(msg.ToolCalls) == 0 {
+				break
+			}
+
+			// 执行工具调用...
+			for _, tc := range msg.ToolCalls {
+				// 检查是否调用了 idle 工具
+				if tc.Function.Name == "idle" {
+					break // 退出工作阶段
+				}
+				// ... 其他工具执行逻辑 ...
+			}
+		}
+
+		// -- IDLE PHASE --
+		tm.setStatus(name, "idle")
+		resume := tm.idlePoll(name, &messages)
+		if !resume {
+			tm.setStatus(name, "shutdown")
+			return
+		}
+		tm.setStatus(name, "working")
+	}
+}
 ```
 
 2. 空闲阶段循环轮询收件箱和任务看板。
 
-```python
-def _idle_poll(self, name, messages):
-    for _ in range(IDLE_TIMEOUT // POLL_INTERVAL):  # 60s / 5s = 12
-        time.sleep(POLL_INTERVAL)
-        inbox = BUS.read_inbox(name)
-        if inbox:
-            messages.append({"role": "user",
-                "content": f"<inbox>{inbox}</inbox>"})
-            return True
-        unclaimed = scan_unclaimed_tasks()
-        if unclaimed:
-            claim_task(unclaimed[0]["id"], name)
-            messages.append({"role": "user",
-                "content": f"<auto-claimed>Task #{unclaimed[0]['id']}: "
-                           f"{unclaimed[0]['subject']}</auto-claimed>"})
-            return True
-    return False  # timeout -> shutdown
+```go
+func (tm *TeammateManager) idlePoll(name string, messages *[]Message) bool {
+	maxCycles := int(idleTimeout.Seconds() / pollInterval.Seconds()) // 60s / 5s = 12
+	for i := 0; i < maxCycles; i++ {
+		time.Sleep(pollInterval)
+
+		// 检查收件箱
+		inboxMsgs, err := bus.ReadInbox(name)
+		if err == nil && len(inboxMsgs) > 0 {
+			var inboxTexts []string
+			for _, msg := range inboxMsgs {
+				inboxTexts = append(inboxTexts, fmt.Sprintf("[%s] %s: %s", msg.Type, msg.From, msg.Content))
+			}
+			*messages = append(*messages, Message{Role: "user", Content: fmt.Sprintf("<inbox>\n%s\n</inbox>", strings.Join(inboxTexts, "\n"))})
+			return true
+		}
+
+		// 扫描未认领的任务
+		unclaimed := tm.scanUnclaimedTasks()
+		if len(unclaimed) > 0 {
+			taskID := unclaimed[0].ID
+		tm.claimTask(taskID, name)
+			*messages = append(*messages, Message{Role: "user", Content: fmt.Sprintf("<auto-claimed>Task #%d: %s</auto-claimed>", taskID, unclaimed[0].Subject)})
+			return true
+		}
+	}
+	return false // timeout -> shutdown
+}
 ```
 
 3. 任务看板扫描: 找 pending 状态、无 owner、未被阻塞的任务。
 
-```python
-def scan_unclaimed_tasks() -> list:
-    unclaimed = []
-    for f in sorted(TASKS_DIR.glob("task_*.json")):
-        task = json.loads(f.read_text())
-        if (task.get("status") == "pending"
-                and not task.get("owner")
-                and not task.get("blockedBy")):
-            unclaimed.append(task)
-    return unclaimed
+```go
+func (tm *TeammateManager) scanUnclaimedTasks() []Task {
+	files, _ := filepath.Glob(filepath.Join(tasksDir, "task_*.json"))
+	var unclaimed []Task
+	for _, file := range files {
+		content, err := os.ReadFile(file)
+		if err != nil {
+			continue
+		}
+		var task Task
+		if err := json.Unmarshal(content, &task); err != nil {
+			continue
+		}
+		if task.Status == "pending" && task.Owner == "" && len(task.BlockedBy) == 0 {
+			unclaimed = append(unclaimed, task)
+		}
+	}
+	return unclaimed
+}
+
+func (tm *TeammateManager) claimTask(taskID int, owner string) error {
+	// 更新任务的所有者
+	taskPath := filepath.Join(tasksDir, fmt.Sprintf("task_%d.json", taskID))
+	content, err := os.ReadFile(taskPath)
+	if err != nil {
+		return err
+	}
+	var task Task
+	if err := json.Unmarshal(content, &task); err != nil {
+		return err
+	}
+	task.Owner = owner
+	task.Status = "in_progress"
+	updatedContent, _ := json.MarshalIndent(task, "", "  ")
+	return os.WriteFile(taskPath, updatedContent, 0644)
+}
 ```
 
 4. 身份重注入: 上下文过短 (说明发生了压缩) 时, 在开头插入身份块。
 
-```python
-if len(messages) <= 3:
-    messages.insert(0, {"role": "user",
-        "content": f"<identity>You are '{name}', role: {role}, "
-                   f"team: {team_name}. Continue your work.</identity>"})
-    messages.insert(1, {"role": "assistant",
-        "content": f"I am {name}. Continuing."})
+```go
+// 身份重注入逻辑已集成在 autonomousLoop 中
+if len(messages) <= 3 {
+    identityBlock := fmt.Sprintf("<identity>You are '%s', role: %s, team: my-team. Continue your work.</identity>", name, role)
+    messages = append([]Message{{Role: "user", Content: identityBlock}}, messages...)
+    messages = append([]Message{{Role: "assistant", Content: fmt.Sprintf("I am %s. Continuing.", name)}}, messages[1:]...)
+}
 ```
 
 ## 相对 s10 的变更
 
-| 组件           | 之前 (s10)       | 之后 (s11)                       |
-|----------------|------------------|----------------------------------|
-| Tools          | 12               | 14 (+idle, +claim_task)          |
-| 自治性         | 领导指派         | 自组织                           |
-| 空闲阶段       | 无               | 轮询收件箱 + 任务看板            |
-| 任务认领       | 仅手动           | 自动认领未分配任务               |
-| 身份           | 系统提示         | + 压缩后重注入                   |
-| 超时           | 无               | 60 秒空闲 -> 自动关机            |
+| 组件     | 之前 (s10) | 之后 (s11)              |
+| -------- | ---------- | ----------------------- |
+| Tools    | 12         | 14 (+idle, +claim_task) |
+| 自治性   | 领导指派   | 自组织                  |
+| 空闲阶段 | 无         | 轮询收件箱 + 任务看板   |
+| 任务认领 | 仅手动     | 自动认领未分配任务      |
+| 身份     | 系统提示   | + 压缩后重注入          |
+| 超时     | 无         | 60 秒空闲 -> 自动关机   |
 
 ## 试一试
 
 ```sh
-cd learn-claude-code
-python agents/s11_autonomous_agents.py
+cd ai-agent-study/s11
+go run main.go
 ```
 
 试试这些 prompt (英文 prompt 对 LLM 效果更好, 也可以用中文):

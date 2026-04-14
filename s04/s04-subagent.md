@@ -2,7 +2,7 @@
 
 `s01 > s02 > s03 > [ s04 ] s05 > s06 | s07 > s08 > s09 > s10 > s11 > s12`
 
-> *"大任务拆小, 每个小任务干净的上下文"* -- 子智能体用独立 messages[], 不污染主对话。
+> _"大任务拆小, 每个小任务干净的上下文"_ -- 子智能体用独立 messages[], 不污染主对话。
 >
 > **Harness 层**: 上下文隔离 -- 守护模型的思维清晰度。
 
@@ -28,65 +28,110 @@ Parent context stays clean. Subagent context is discarded.
 
 ## 工作原理
 
+#### Parent System Prompt
+
+```
+You are a coding agent at %s. Use the task tool to delegate exploration or subtasks.
+```
+
+#### Subagent System Prompt
+
+```
+You are a coding subagent at %s. Complete the given task, then summarize your findings.
+```
+
 1. 父智能体有一个 `task` 工具。子智能体拥有除 `task` 外的所有基础工具 (禁止递归生成)。
 
-```python
-PARENT_TOOLS = CHILD_TOOLS + [
-    {"name": "task",
-     "description": "Spawn a subagent with fresh context.",
-     "input_schema": {
-         "type": "object",
-         "properties": {"prompt": {"type": "string"}},
-         "required": ["prompt"],
-     }},
-]
+```go
+// Parent tools include child tools plus task tool
+var parentTools = []Tool{
+	// ...CHILD_TOOLS...
+	{Type: "function", Function: FunctionDef{
+		Name: "task",
+		Description: "Spawn a subagent with fresh context.",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"prompt": map[string]string{"type": "string"},
+			},
+			"required": []string{"prompt"},
+		},
+	}},
+}
 ```
 
 2. 子智能体以 `messages=[]` 启动, 运行自己的循环。只有最终文本返回给父智能体。
 
-```python
-def run_subagent(prompt: str) -> str:
-    sub_messages = [{"role": "user", "content": prompt}]
-    for _ in range(30):  # safety limit
-        response = client.messages.create(
-            model=MODEL, system=SUBAGENT_SYSTEM,
-            messages=sub_messages,
-            tools=CHILD_TOOLS, max_tokens=8000,
-        )
-        sub_messages.append({"role": "assistant",
-                             "content": response.content})
-        if response.stop_reason != "tool_use":
-            break
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                output = handler(**block.input)
-                results.append({"type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": str(output)[:50000]})
-        sub_messages.append({"role": "user", "content": results})
-    return "".join(
-        b.text for b in response.content if hasattr(b, "text")
-    ) or "(no summary)"
+```go
+func runSubagent(prompt string) string {
+	subMessages := []Message{{Role: "user", Content: prompt}}
+	for i := 0; i < 30; i++ { // safety limit
+		msg, err := chatCompletionsCreate(subMessages, childTools)
+		if err != nil {
+			log.Printf("Error in subagent: %v", err)
+			return fmt.Sprintf("Error: %v", err)
+		}
+
+		subMessages = append(subMessages, msg)
+		if len(msg.ToolCalls) == 0 {
+			break
+		}
+
+		var results []map[string]interface{}
+		for _, tc := range msg.ToolCalls {
+			name := tc.Function.Name
+			var args map[string]interface{}
+			json.Unmarshal([]byte(tc.Function.Arguments), &args)
+
+			handler, ok := childToolHandlers[name]
+			var output string
+			if ok {
+				output = handler.(func(map[string]interface{}) string)(args)
+			} else {
+				output = fmt.Sprintf("Unknown tool: %s", name)
+			}
+
+			results = append(results, map[string]interface{}{
+				"type": "tool_result",
+				"tool_use_id": tc.ID,
+				"content": output[:50000],
+			})
+		}
+
+		resultsJSON, _ := json.Marshal(results)
+		subMessages = append(subMessages, Message{Role: "user", Content: string(resultsJSON)})
+	}
+
+	// 提取文本摘要
+	var textParts []string
+	for _, content := range msg.Content {
+		if str, ok := content.(string); ok {
+			textParts = append(textParts, str)
+		}
+	}
+	if len(textParts) == 0 {
+		return "(no summary)"
+	}
+	return strings.Join(textParts, " ")
+}
 ```
 
 子智能体可能跑了 30+ 次工具调用, 但整个消息历史直接丢弃。父智能体收到的只是一段摘要文本, 作为普通 `tool_result` 返回。
 
 ## 相对 s03 的变更
 
-| 组件           | 之前 (s03)       | 之后 (s04)                    |
-|----------------|------------------|-------------------------------|
-| Tools          | 5                | 5 (基础) + task (仅父端)      |
-| 上下文         | 单一共享         | 父 + 子隔离                   |
-| Subagent       | 无               | `run_subagent()` 函数         |
-| 返回值         | 不适用           | 仅摘要文本                    |
+| 组件     | 之前 (s03) | 之后 (s04)               |
+| -------- | ---------- | ------------------------ |
+| Tools    | 5          | 5 (基础) + task (仅父端) |
+| 上下文   | 单一共享   | 父 + 子隔离              |
+| Subagent | 无         | `run_subagent()` 函数    |
+| 返回值   | 不适用     | 仅摘要文本               |
 
 ## 试一试
 
 ```sh
-cd learn-claude-code
-python agents/s04_subagent.py
+cd ai-agent-study/s04
+go run main.go
 ```
 
 试试这些 prompt (英文 prompt 对 LLM 效果更好, 也可以用中文):

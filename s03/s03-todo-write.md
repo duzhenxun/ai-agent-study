@@ -2,7 +2,7 @@
 
 `s01 > s02 > [ s03 ] s04 > s05 > s06 | s07 > s08 > s09 > s10 > s11 > s12`
 
-> *"没有计划的 agent 走哪算哪"* -- 先列步骤再动手, 完成率翻倍。
+> _"没有计划的 agent 走哪算哪"_ -- 先列步骤再动手, 完成率翻倍。
 >
 > **Harness 层**: 规划 -- 让模型不偏航, 但不替它画航线。
 
@@ -34,61 +34,128 @@
 
 ## 工作原理
 
+#### 系统提示
+
+```
+You are a coding agent at %s.
+Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
+Prefer tools over prose.
+```
+
 1. TodoManager 存储带状态的项目。同一时间只允许一个 `in_progress`。
 
-```python
-class TodoManager:
-    def update(self, items: list) -> str:
-        validated, in_progress_count = [], 0
-        for item in items:
-            status = item.get("status", "pending")
-            if status == "in_progress":
-                in_progress_count += 1
-            validated.append({"id": item["id"], "text": item["text"],
-                              "status": status})
-        if in_progress_count > 1:
-            raise ValueError("Only one task can be in_progress")
-        self.items = validated
-        return self.render()
+```go
+// TodoManager 管理待办事项
+type TodoManager struct {
+	items []TodoItem
+	mu    sync.Mutex
+}
+
+type TodoItem struct {
+	ID     int    `json:"id"`
+	Text   string `json:"text"`
+	Status string `json:"status"`
+}
+
+func NewTodoManager() *TodoManager {
+	return &TodoManager{
+		items: []TodoItem{},
+	}
+}
+
+func (tm *TodoManager) Update(items []TodoItem) (string, error) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	validated := []TodoItem{}
+	inProgressCount := 0
+	for _, item := range items {
+		status := item.Status
+		if status == "" {
+			status = "pending"
+		}
+		if status == "in_progress" {
+			inProgressCount++
+		}
+		validated = append(validated, TodoItem{
+			ID:     item.ID,
+			Text:   item.Text,
+			Status: status,
+		})
+	}
+
+	if inProgressCount > 1 {
+		return "", fmt.Errorf("Only one task can be in_progress")
+	}
+
+	tm.items = validated
+	return tm.render(), nil
+}
 ```
 
 2. `todo` 工具和其他工具一样加入 dispatch map。
 
-```python
-TOOL_HANDLERS = {
-    # ...base tools...
-    "todo": lambda **kw: TODO.update(kw["items"]),
+```go
+// Tool Handlers Map
+var toolHandlers = map[string]interface{}{
+	// ...base tools...
+	"todo": func(args map[string]interface{}) string {
+		itemsInterface := args["items"].([]interface{})
+		var items []TodoItem
+		for _, itemInterface := range itemsInterface {
+			if itemMap, ok := itemInterface.(map[string]interface{}); ok {
+				id := int(itemMap["id"].(float64))
+				text := itemMap["text"].(string)
+				status := ""
+				if s, ok := itemMap["status"].(string); ok {
+					status = s
+				}
+				items = append(items, TodoItem{ID: id, Text: text, Status: status})
+			}
+		}
+		result, err := todoManager.Update(items)
+		if err != nil {
+			return fmt.Sprintf("Error: %v", err)
+		}
+		return result
+	},
 }
 ```
 
 3. nag reminder: 模型连续 3 轮以上不调用 `todo` 时注入提醒。
 
-```python
-if rounds_since_todo >= 3 and messages:
-    last = messages[-1]
-    if last["role"] == "user" and isinstance(last.get("content"), list):
-        last["content"].insert(0, {
-            "type": "text",
-            "text": "<reminder>Update your todos.</reminder>",
-        })
+```go
+if roundsSinceTodo >= 3 && len(messages) > 0 {
+	last := messages[len(messages)-1]
+	if last.Role == "user" {
+		if contentList, ok := last.Content.([]interface{}); ok {
+			reminder := map[string]interface{}{
+				"type": "text",
+				"text": "<reminder>Update your todos.</reminder>",
+			}
+			contentList = append([]interface{}{reminder}, contentList...)
+			last.Content = contentList
+		}
+	}
+}
 ```
 
 "同时只能有一个 in_progress" 强制顺序聚焦。nag reminder 制造问责压力 -- 你不更新计划, 系统就追着你问。
 
 ## 相对 s02 的变更
 
-| 组件           | 之前 (s02)       | 之后 (s03)                     |
-|----------------|------------------|--------------------------------|
-| Tools          | 4                | 5 (+todo)                      |
-| 规划           | 无               | 带状态的 TodoManager           |
-| Nag 注入       | 无               | 3 轮后注入 `<reminder>`        |
-| Agent loop     | 简单分发         | + rounds_since_todo 计数器     |
+| 组件       | 之前 (s02) | 之后 (s03)                 |
+| ---------- | ---------- | -------------------------- |
+| Tools      | 4          | 5 (+todo)                  |
+| 规划       | 无         | 带状态的 TodoManager       |
+| Nag 注入   | 无         | 3 轮后注入 `<reminder>`    |
+| Agent loop | 简单分发   | + rounds_since_todo 计数器 |
 
 ## 试一试
 
 ```sh
-cd learn-claude-code
-python agents/s03_todo_write.py
+cd ai-agent-study/s03
+go run main.go
 ```
 
 试试这些 prompt (英文 prompt 对 LLM 效果更好, 也可以用中文):
