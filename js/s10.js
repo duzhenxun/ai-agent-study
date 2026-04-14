@@ -284,7 +284,7 @@ async function chatCompletionsCreate(messages) {
                 required: ["from", "plan"],
               },
             },
-            },
+          },
           {
             type: "function",
             function: {
@@ -299,7 +299,7 @@ async function chatCompletionsCreate(messages) {
                   },
                   approve: { 
                     type: "boolean",
-                    description: "Whether to approve the shutdown"
+                    description: "Whether to approve shutdown"
                   }
                 },
                 required: ["req_id", "approve"],
@@ -320,7 +320,7 @@ async function chatCompletionsCreate(messages) {
                   },
                   approve: { 
                     type: "boolean",
-                    description: "Whether to approve the plan"
+                    description: "Whether to approve plan"
                   }
                 },
                 required: ["req_id", "approve"],
@@ -428,12 +428,12 @@ async function agentLoop(messages, teamManager) {
             
           case "plan_response":
             console.log(`\n📋 响应计划请求: ${args.req_id}`);
-            const request = planRequests[args.req_id];
-            if (request) {
-              request.status = args.approve ? 'approved' : 'rejected';
+            const planRequest = planRequests[args.req_id];
+            if (planRequest) {
+              planRequest.status = args.approve ? 'approved' : 'rejected';
               
               // 更新请求状态
-              planRequests[args.req_id] = request;
+              planRequests[args.req_id] = planRequest;
               
               // 通知请求者
               await sendInboxMessage('lead', args.from || 'unknown', `Plan ${args.approve ? 'approved' : 'rejected'} for request ${args.req_id}`);
@@ -533,7 +533,7 @@ async function main() {
         }
         
         // 更新状态
-        await teamManager.updateStatus();
+        await teammate.updateStatus();
         
         await new Promise(resolve => setTimeout(resolve, 1000));
       } catch (err) {
@@ -569,7 +569,8 @@ async function main() {
       });
     };
 
-  ask();
+    ask();
+  }
 }
 
 // 启动
