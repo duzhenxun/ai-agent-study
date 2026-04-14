@@ -154,3 +154,319 @@ go run main.go
 3. `Spawn bob with a risky refactoring task. Review and reject his plan.`
 4. `Spawn charlie, have him submit a plan, then approve it.`
 5. 输入 `/team` 监控状态
+
+## 业务流程图
+
+### 系统架构总览
+
+```mermaid
+graph TB
+    subgraph "Team Lead Loop"
+        User[User Input] --> LeadLoop[Lead Agent Loop]
+        LeadLoop --> LLMCall[LLM API Call]
+        LLMCall --> ToolExec[Tool Execution]
+        ToolExec --> LeadLoop
+    end
+
+    subgraph "Protocol Management"
+        ProtocolMgr[Protocol Manager] --> ShutdownTracker[Shutdown Requests]
+        ProtocolMgr --> PlanTracker[Plan Requests]
+        ProtocolMgr --> TrackerLock[Thread Safety]
+    end
+
+    subgraph "Message System"
+        MsgBus[MessageBus] --> Inboxes[JSONL Inboxes]
+        MsgBus --> Files[File System]
+        MsgBus --> MsgMutex[Thread Safety]
+    end
+
+    subgraph "FSM Engine"
+        ShutdownFSM[Shutdown FSM]
+        PlanFSM[Plan FSM]
+        SharedFSM[Shared FSM Logic]
+    end
+
+    subgraph "Teammate Loops"
+        Alice[Alice Loop] --> MsgBus
+        Bob[Bob Loop] --> MsgBus
+        TeamLead[Team Lead Loop] --> MsgBus
+    end
+
+    ToolExec --> ProtocolMgr
+    ToolExec --> MsgBus
+    ProtocolMgr --> ShutdownFSM
+    ProtocolMgr --> PlanFSM
+    ShutdownFSM --> SharedFSM
+    PlanFSM --> SharedFSM
+```
+
+### 详细流程序列
+
+#### 1. 关机请求协议流程
+
+```mermaid
+sequenceDiagram
+    participant User as User
+    participant LeadLoop as Lead Loop
+    participant ProtocolMgr as Protocol Manager
+    participant ShutdownTracker as Shutdown Tracker
+    participant Alice as Alice
+    participant MsgBus as MessageBus
+
+    User->>LeadLoop: Request teammate shutdown
+    LeadLoop->>ProtocolMgr: handleShutdownRequest(teammate)
+    ProtocolMgr->>ShutdownTracker: Generate request_id
+    ShutdownTracker->>ShutdownTracker: Create pending request
+    ProtocolMgr->>MsgBus: Send shutdown_request
+    MsgBus-->>Alice: Request with request_id
+    ProtocolMgr-->>LeadLoop: Request sent confirmation
+    LeadLoop-->>User: Display request status
+
+    Note over Alice: Alice processes request
+    Alice->>ProtocolMgr: shutdown_response(approve, reason)
+    ProtocolMgr->>ShutdownTracker: Update request status
+    ShutdownTracker-->>ProtocolMgr: Status updated
+    ProtocolMgr->>MsgBus: Send response to lead
+    MsgBus-->>LeadLoop: Response received
+```
+
+#### 2. 计划审批协议流程
+
+```mermaid
+sequenceDiagram
+    participant Alice as Alice
+    participant ProtocolMgr as Protocol Manager
+    participant PlanTracker as Plan Tracker
+    participant LeadLoop as Lead Loop
+    participant MsgBus as MessageBus
+
+    Alice->>ProtocolMgr: submit_plan(plan_details)
+    ProtocolMgr->>PlanTracker: Generate request_id
+    PlanTracker->>PlanTracker: Create pending request
+    ProtocolMgr->>MsgBus: Send plan_request to lead
+    MsgBus-->>LeadLoop: Plan with request_id
+
+    Note over LeadLoop: Lead reviews plan
+    LeadLoop->>ProtocolMgr: handlePlanReview(request_id, approve, feedback)
+    ProtocolMgr->>PlanTracker: Update request status
+    PlanTracker-->>ProtocolMgr: Status updated
+    ProtocolMgr->>MsgBus: Send plan_approval_response
+    MsgBus-->>Alice: Approval decision
+
+    alt Plan approved
+        Alice->>Alice: Start executing plan
+    else Plan rejected
+        Alice->>Alice: Revise plan based on feedback
+    end
+```
+
+#### 3. 共享 FSM 状态管理流程
+
+```mermaid
+sequenceDiagram
+    participant Request as Request Handler
+    participant FSM as Shared FSM
+    participant Tracker as Request Tracker
+    participant Response as Response Handler
+
+    Request->>FSM: Create request with request_id
+    FSM->>Tracker: Store as pending state
+    Tracker-->>FSM: Request stored
+
+    Note over FSM: State transition logic
+    alt Approve request
+        Response->>FSM: approve(request_id)
+        FSM->>Tracker: Update to approved
+        Tracker-->>FSM: State updated
+    else Reject request
+        Response->>FSM: reject(request_id)
+        FSM->>Tracker: Update to rejected
+        Tracker-->>FSM: State updated
+    end
+
+    FSM-->>Response: State change confirmation
+```
+
+#### 4. 协议跟踪监控流程
+
+```mermaid
+sequenceDiagram
+    participant User as User
+    participant LeadLoop as Lead Loop
+    participant ProtocolMgr as Protocol Manager
+    participant ShutdownTracker as Shutdown Tracker
+    participant PlanTracker as Plan Tracker
+
+    User->>LeadLoop: Request protocol status
+    LeadLoop->>ProtocolMgr: Get all request statuses
+    ProtocolMgr->>ShutdownTracker: Get shutdown requests
+    ProtocolMgr->>PlanTracker: Get plan requests
+    ShutdownTracker-->>ProtocolMgr: Shutdown request list
+    PlanTracker-->>ProtocolMgr: Plan request list
+    ProtocolMgr->>ProtocolMgr: Format status report
+    ProtocolMgr-->>LeadLoop: Complete status report
+    LeadLoop-->>User: Display protocol status
+```
+
+### 关键状态转换
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: request_created()
+    pending --> approved: approve_request()
+    pending --> rejected: reject_request()
+    approved --> [*]: request_completed()
+    rejected --> [*]: request_closed()
+
+    note right of pending
+        Request waiting for response
+        request_id assigned
+        Tracking active
+    end note
+
+    note right of approved
+        Request accepted
+        Action authorized
+        Proceed with execution
+    end note
+
+    note right of rejected
+        Request denied
+        Feedback provided
+        May resubmit
+    end note
+```
+
+### 协议消息流架构
+
+```mermaid
+graph TB
+    subgraph "Request Types"
+        ShutdownReq[Shutdown Request]
+        PlanReq[Plan Request]
+        BroadcastReq[Broadcast Request]
+    end
+
+    subgraph "Response Types"
+        ShutdownResp[Shutdown Response]
+        PlanResp[Plan Response]
+        ApprovalResp[Approval Response]
+    end
+
+    subgraph "Message Processing"
+        GenerateID[Generate request_id]
+        TrackRequest[Track Request]
+        SendRequest[Send Request]
+        ProcessResponse[Process Response]
+        UpdateStatus[Update Status]
+    end
+
+    subgraph "Storage Layer"
+        ShutdownTracker[Shutdown Tracker]
+        PlanTracker[Plan Tracker]
+        Inboxes[JSONL Inboxes]
+        FileSystem[File System]
+    end
+
+    ShutdownReq --> GenerateID
+    PlanReq --> GenerateID
+    BroadcastReq --> GenerateID
+
+    GenerateID --> TrackRequest
+    TrackRequest --> SendRequest
+    SendRequest --> Inboxes
+
+    ShutdownResp --> ProcessResponse
+    PlanResp --> ProcessResponse
+    ApprovalResp --> ProcessResponse
+
+    ProcessResponse --> UpdateStatus
+    UpdateStatus --> ShutdownTracker
+    UpdateStatus --> PlanTracker
+```
+
+### 协议协调架构
+
+```mermaid
+graph TB
+    subgraph "Protocol Layer"
+        ShutdownProtocol[Shutdown Protocol]
+        PlanProtocol[Plan Protocol]
+        SharedLogic[Shared FSM Logic]
+    end
+
+    subgraph "Tracking Layer"
+        RequestTracker[Request Tracker]
+        StateManager[State Manager]
+        IDGenerator[ID Generator]
+    end
+
+    subgraph "Communication Layer"
+        MessageRouter[Message Router]
+        RequestHandler[Request Handler]
+        ResponseHandler[Response Handler]
+    end
+
+    subgraph "Storage Layer"
+        ShutdownStore[Shutdown Storage]
+        PlanStore[Plan Storage]
+        MessageStore[Message Store]
+    end
+
+    ShutdownProtocol --> SharedLogic
+    PlanProtocol --> SharedLogic
+    SharedLogic --> RequestTracker
+
+    RequestTracker --> StateManager
+    RequestTracker --> IDGenerator
+    StateManager --> MessageRouter
+
+    MessageRouter --> RequestHandler
+    MessageRouter --> ResponseHandler
+    RequestHandler --> ShutdownStore
+    ResponseHandler --> PlanStore
+    MessageRouter --> MessageStore
+```
+
+### 核心组件交互
+
+```mermaid
+graph TB
+    subgraph "ProtocolManager Core"
+        PM[Protocol Manager] --> ST[Shutdown Tracker]
+        PM --> PT[Plan Tracker]
+        PM --> TL[Tracker Lock]
+    end
+
+    subgraph "FSM Engine Core"
+        FSM[Shared FSM] --> States[State Machine]
+        FSM --> Transitions[State Transitions]
+        FSM --> Validator[Request Validator]
+    end
+
+    subgraph "Protocol Operations"
+        ShutdownReq[Shutdown Request] --> ShutdownResp[Shutdown Response]
+        PlanReq[Plan Request] --> PlanResp[Plan Response]
+        Track[Track Request] --> Update[Update Status]
+        Generate[Generate ID] --> Store[Store Request]
+    end
+
+    subgraph "Team Integration"
+        TL[Team Lead] --> ProtocolTools[Protocol Tools]
+        Teammate[Teammate] --> ProtocolTools
+        ProtocolTools --> ShutdownReq
+        ProtocolTools --> PlanReq
+        ProtocolTools --> Track
+        ProtocolTools --> TL
+        ProtocolTools --> Teammate
+    end
+
+    TL --> PM
+    ST --> FSM
+    PT --> FSM
+    TL --> Track
+    Track --> Generate
+    Generate --> Store
+    Store --> ST
+    Store --> PT
+```

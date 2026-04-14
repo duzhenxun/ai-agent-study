@@ -207,3 +207,203 @@ go run main.go
 1. `Run "sleep 5 && echo done" in the background, then create a file while it runs`
 2. `Start 3 background tasks: "sleep 2", "sleep 4", "sleep 6". Check their status.`
 3. `Run pytest in the background and keep working on other things`
+
+## 业务流程图
+
+### 系统架构总览
+
+```mermaid
+graph TB
+    subgraph "主线程"
+        User[用户输入] --> AgentLoop[Agent 循环]
+        AgentLoop --> DrainQueue[清空通知队列]
+        DrainQueue --> LLMCall[LLM API 调用]
+        LLMCall --> ToolExec[工具执行]
+        ToolExec --> AgentLoop
+    end
+
+    subgraph "后台线程"
+        BgRun[后台运行] --> TaskExec[任务执行]
+        TaskExec --> NotifQueue[通知队列]
+        NotifQueue --> DrainQueue
+    end
+
+    subgraph "任务管理"
+        BgMgr[后台管理器] --> TaskMap[任务映射]
+        BgMgr --> NotifQueue
+        Check[检查后台] --> TaskMap
+    end
+
+    ToolExec --> BgRun
+    ToolExec --> Check
+    BgRun --> BgMgr
+```
+
+### 详细流程序列
+
+#### 1. 用户交互与 Agent 主循环流程
+
+```mermaid
+sequenceDiagram
+    participant User as 用户
+    participant AgentLoop as Agent循环
+    participant BgManager as 后台管理器
+    participant LLM as 大模型
+    participant NotificationQueue as 通知队列
+
+    User->>AgentLoop: 输入命令
+    AgentLoop->>BgManager: 清空通知()
+    BgManager->>NotificationQueue: 获取待处理通知
+    NotificationQueue-->>BgManager: 返回通知
+    BgManager-->>AgentLoop: 通知列表
+
+    alt 有后台结果
+        AgentLoop->>LLM: 添加后台结果到消息
+        AgentLoop->>LLM: 聊天完成请求
+    else 无后台结果
+        AgentLoop->>LLM: 直接发送聊天完成请求
+    end
+
+    LLM-->>AgentLoop: LLM响应和工具调用
+    AgentLoop->>AgentLoop: 执行工具
+    AgentLoop-->>User: 显示结果
+```
+
+#### 2. 后台任务执行流程
+
+```mermaid
+sequenceDiagram
+    participant AgentLoop as Agent循环
+    participant BackgroundManager as 后台管理器
+    participant TaskExecution as 任务执行
+    participant NotificationQueue as 通知队列
+    participant Subprocess as 子进程
+
+    AgentLoop->>BackgroundManager: 后台运行(命令)
+    BackgroundManager->>BackgroundManager: 生成任务ID
+    BackgroundManager->>BackgroundManager: 创建"运行中"状态的任务
+    BackgroundManager->>TaskExecution: 启动执行(任务ID, 命令)
+    BackgroundManager-->>AgentLoop: 立即返回任务ID
+
+    TaskExecution->>Subprocess: 执行命令上下文()
+    Subprocess-->>TaskExecution: 等待完成
+
+    alt 任务成功完成
+        TaskExecution->>TaskExecution: 状态 = "已完成"
+    else 任务超时
+        TaskExecution->>TaskExecution: 状态 = "超时"
+    else 任务失败
+        TaskExecution->>TaskExecution: 状态 = "错误"
+    end
+
+    TaskExecution->>BackgroundManager: 更新任务状态和结果
+    TaskExecution->>NotificationQueue: 添加通知
+    NotificationQueue-->>AgentLoop: 可用于下次LLM调用
+```
+
+#### 3. 任务状态检查流程
+
+```mermaid
+sequenceDiagram
+    participant AgentLoop as Agent循环
+    participant BackgroundManager as 后台管理器
+    participant TaskMap as 任务映射
+
+    AgentLoop->>BackgroundManager: 检查后台(任务ID?)
+
+    alt 提供任务ID
+        BackgroundManager->>TaskMap: 查找特定任务
+        TaskMap-->>BackgroundManager: 任务详情
+        BackgroundManager-->>AgentLoop: 单个任务状态
+    else 未提供任务ID
+        BackgroundManager->>TaskMap: 获取所有任务
+        TaskMap-->>BackgroundManager: 所有任务列表
+        BackgroundManager-->>AgentLoop: 任务概览
+    end
+```
+
+### 关键状态转换
+
+```mermaid
+stateDiagram-v2
+    [*] --> 运行中: 调用后台运行()
+    运行中 --> 已完成: 命令成功
+    运行中 --> 超时: 超过300秒超时
+    运行中 --> 错误: 命令失败
+    已完成 --> [*]: 任务结果被消费
+    超时 --> [*]: 错误结果被消费
+    错误 --> [*]: 错误结果被消费
+
+    note right of 运行中
+        后台协程在子进程中
+        执行命令，
+        限制300秒超时
+    end note
+
+    note right of 已完成
+        结果添加到通知队列
+        等待下次LLM调用
+    end note
+```
+
+### 数据流架构
+
+```mermaid
+graph LR
+    subgraph "输入流程"
+        A[用户命令] --> B{工具类型}
+        B -->|后台运行| C[后台任务]
+        B -->|检查后台| D[任务查询]
+        B -->|其他工具| E[立即执行]
+    end
+
+    subgraph "后台处理"
+        C --> F[任务队列]
+        F --> G[协程池]
+        G --> H[子进程执行]
+        H --> I[结果处理]
+        I --> J[通知队列]
+    end
+
+    subgraph "输出流程"
+        J --> K[下次LLM调用]
+        D --> L[任务状态响应]
+        E --> M[直接结果]
+        K --> N[增强上下文]
+        L --> N
+        M --> N
+        N --> O[用户响应]
+    end
+```
+
+### 核心组件交互
+
+```mermaid
+graph TB
+    subgraph "BackgroundManager Core"
+        BM[后台管理器] --> TM[任务映射]
+        BM --> NQ[通知队列]
+        BM --> MU[同步锁]
+    end
+
+    subgraph "Task Lifecycle"
+        Run[运行任务] --> Create[创建任务]
+        Create --> Execute[执行任务]
+        Execute --> Update[更新状态]
+        Update --> Notify[添加通知]
+        Notify --> Drain[清空通知]
+    end
+
+    subgraph "Agent Integration"
+        AL[Agent循环] --> Drain
+        Drain --> MSG[添加消息]
+        MSG --> LLM[LLM调用]
+        LLM --> Tools[工具执行]
+        Tools --> Run
+    end
+
+    MU --> TM
+    MU --> NQ
+    Execute --> TM
+    Execute --> NQ
+```

@@ -231,3 +231,308 @@ go run main.go
 3. `Run "git status --short" in worktree "auth-refactor".`
 4. `Keep worktree "ui-login", then list worktrees and inspect events.`
 5. `Remove worktree "auth-refactor" with complete_task=true, then list tasks/worktrees/events.`
+
+## Business Flow Diagram
+
+### Overall System Architecture
+
+```mermaid
+graph TB
+    subgraph "Control Plane"
+        TaskMgr[Task Manager] --> TaskFiles[Task JSON Files]
+        TaskMgr --> TaskBoard[Task Board]
+        TaskMgr --> TaskFS[.tasks/ Directory]
+    end
+
+    subgraph "Execution Plane"
+        WorktreeMgr[Worktree Manager] --> WorktreeFS[.worktrees/ Directory]
+        WorktreeMgr --> GitWorktrees[Git Worktrees]
+        WorktreeMgr --> IndexRegistry[Index Registry]
+    end
+
+    subgraph "Agent Loop"
+        User[User Input] --> AgentLoop[Agent Loop]
+        AgentLoop --> LLMCall[LLM API Call]
+        LLMCall --> ToolExec[Tool Execution]
+        ToolExec --> AgentLoop
+    end
+
+    subgraph "Isolation Layer"
+        DirectoryIsolation[Directory Isolation] --> WorktreeDirs[Worktree Directories]
+        DirectoryIsolation --> GitBranches[Git Branches]
+        DirectoryIsolation --> TaskBinding[Task Binding]
+    end
+
+    subgraph "Event System"
+        EventLogger[Event Logger] --> EventStream[events.jsonl]
+        EventLogger --> LifecycleEvents[Lifecycle Events]
+    end
+
+    ToolExec --> TaskMgr
+    ToolExec --> WorktreeMgr
+    TaskMgr --> WorktreeMgr
+    WorktreeMgr --> DirectoryIsolation
+    WorktreeMgr --> EventLogger
+```
+
+### Detailed Flow Sequences
+
+#### 1. Task Creation and Worktree Binding Flow
+
+```mermaid
+sequenceDiagram
+    participant User as User
+    participant Agent as Agent Loop
+    participant TaskMgr as Task Manager
+    participant WorktreeMgr as Worktree Manager
+    participant Git as Git System
+    participant FileSystem as File System
+
+    User->>Agent: Create task for work
+    Agent->>TaskMgr: Create task(subject, description)
+    TaskMgr->>FileSystem: Save task_*.json (status=pending)
+    FileSystem-->>TaskMgr: Task saved
+    TaskMgr-->>Agent: Task created
+
+    User->>Agent: Create worktree for task
+    Agent->>WorktreeMgr: Create(worktree_name, task_id)
+    WorktreeMgr->>Git: git worktree add branch worktree_path
+    Git-->>WorktreeMgr: Worktree created
+    WorktreeMgr->>FileSystem: Update index.json
+    WorktreeMgr->>TaskMgr: bindWorktree(task_id, worktree_name)
+    TaskMgr->>FileSystem: Update task_*.json (status=in_progress, worktree=name)
+    FileSystem-->>TaskMgr: Task updated
+    WorktreeMgr-->>Agent: Worktree created and bound
+    Agent-->>User: Task and worktree ready
+```
+
+#### 2. Isolated Command Execution Flow
+
+```mermaid
+sequenceDiagram
+    participant Agent as Agent Loop
+    participant WorktreeMgr as Worktree Manager
+    participant Worktree as Worktree Directory
+    participant Command as Command Executor
+    participant FileSystem as File System
+
+    Agent->>WorktreeMgr: Run command in worktree
+    WorktreeMgr->>FileSystem: Get worktree path
+    FileSystem-->>WorktreeMgr: Worktree directory path
+    WorktreeMgr->>Command: Execute command in directory
+    Command->>Worktree: Run command with cwd=worktree_path
+    Worktree-->>Command: Command output
+    Command-->>WorktreeMgr: Execution result
+    WorktreeMgr-->>Agent: Return output
+
+    Note over Worktree: Command runs in isolated directory
+    Note over FileSystem: No interference with other worktrees
+```
+
+#### 3. Worktree Lifecycle Management Flow
+
+```mermaid
+sequenceDiagram
+    participant Agent as Agent Loop
+    participant WorktreeMgr as Worktree Manager
+    participant TaskMgr as Task Manager
+    participant EventLogger as Event Logger
+    participant Git as Git System
+    participant FileSystem as File System
+
+    Agent->>WorktreeMgr: Remove worktree (complete_task=true)
+    WorktreeMgr->>FileSystem: Get worktree info
+    FileSystem-->>WorktreeMgr: Worktree details
+
+    WorktreeMgr->>EventLogger: Emit event "worktree.remove.before"
+    EventLogger->>FileSystem: Append to events.jsonl
+
+    WorktreeMgr->>Git: git worktree remove worktree_path
+    Git-->>WorktreeMgr: Worktree removed
+
+    WorktreeMgr->>TaskMgr: Complete bound task
+    TaskMgr->>FileSystem: Update task_*.json (status=completed)
+    FileSystem-->>TaskMgr: Task completed
+
+    WorktreeMgr->>FileSystem: Update index.json (remove entry)
+    WorktreeMgr->>EventLogger: Emit event "task.completed"
+    EventLogger->>FileSystem: Append to events.jsonl
+
+    WorktreeMgr-->>Agent: Worktree removed and task completed
+```
+
+#### 4. Task-Worktree State Synchronization Flow
+
+```mermaid
+sequenceDiagram
+    participant TaskMgr as Task Manager
+    participant WorktreeMgr as Worktree Manager
+    participant TaskFS as Task File System
+    participant WorktreeFS as Worktree File System
+    participant EventLogger as Event Logger
+
+    TaskMgr->>WorktreeMgr: bindWorktree(task_id, worktree_name)
+    WorktreeMgr->>TaskFS: Load task_*.json
+    TaskFS-->>WorktreeMgr: Task data
+    WorktreeMgr->>WorktreeMgr: Set worktree field, update status
+    WorktreeMgr->>TaskFS: Save updated task_*.json
+    WorktreeMgr->>WorktreeFS: Update index.json
+    WorktreeFS-->>WorktreeMgr: Index updated
+    WorktreeMgr->>EventLogger: Emit binding event
+    EventLogger->>WorktreeFS: Log to events.jsonl
+    WorktreeMgr-->>TaskMgr: Binding complete
+
+    Note over TaskMgr: Task status and worktree reference synchronized
+    Note over WorktreeMgr: Worktree registry and task binding synchronized
+```
+
+### Key State Transitions
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: task_create()
+    pending --> in_progress: worktree_bound()
+    in_progress --> completed: worktree_remove(complete=true)
+    in_progress --> pending: worktree_remove(complete=false)
+    completed --> [*]: task_archived
+
+    [*] --> absent: worktree_create()
+    absent --> active: git_worktree_add()
+    active --> kept: worktree_keep()
+    active --> removed: worktree_remove()
+    kept --> removed: worktree_remove()
+    removed --> [*]: cleanup_complete()
+
+    note right of pending
+        Task created, no worktree
+        Waiting for assignment
+    end note
+
+    note right of in_progress
+        Worktree bound and active
+        Work in isolated directory
+    end note
+
+    note right of completed
+        Work finished
+        Worktree cleaned up
+    end note
+
+    note right of active
+        Worktree exists
+        Isolated execution
+    end note
+```
+
+### Task-Worktree Isolation Architecture
+
+```mermaid
+graph TB
+    subgraph "Control Plane (.tasks/)"
+        Task1[task_1.json] --> TaskStatus1[status: in_progress]
+        Task1 --> WorktreeRef1[worktree: auth-refactor]
+        Task2[task_2.json] --> TaskStatus2[status: pending]
+        Task2 --> WorktreeRef2[worktree: ""]
+    end
+
+    subgraph "Execution Plane (.worktrees/)"
+        AuthDir[auth-refactor/] --> GitBranch1[branch: wt/auth-refactor]
+        AuthDir --> TaskID1[task_id: 1]
+        LoginDir[ui-login/] --> GitBranch2[branch: wt/ui-login]
+        LoginDir --> TaskID2[task_id: 2]
+    end
+
+    subgraph "Binding Layer"
+        TaskBinding[Task Binding] --> WorktreeBinding[Worktree Binding]
+        TaskBinding --> StateSync[State Synchronization]
+        WorktreeBinding --> DirectoryIsolation[Directory Isolation]
+    end
+
+    subgraph "Event Layer"
+        EventStream[events.jsonl] --> LifecycleEvents[Lifecycle Events]
+        EventStream --> StateChanges[State Changes]
+        EventStream --> AuditTrail[Audit Trail]
+    end
+
+    TaskStatus1 --> TaskBinding
+    WorktreeRef1 --> WorktreeBinding
+    AuthDir --> DirectoryIsolation
+    LoginDir --> DirectoryIsolation
+    TaskBinding --> EventStream
+```
+
+### Parallel Execution Architecture
+
+```mermaid
+graph TB
+    subgraph "Isolation Channels"
+        Channel1[Channel 1: auth-refactor] --> AuthDir[.worktrees/auth-refactor/]
+        Channel2[Channel 2: ui-login] --> LoginDir[.worktrees/ui-login/]
+        Channel3[Channel 3: api-update] --> ApiDir[.worktrees/api-update/]
+    end
+
+    subgraph "Task Assignment"
+        Task1[Task 1: Auth Refactor] --> Channel1
+        Task2[Task 2: UI Login] --> Channel2
+        Task3[Task 3: API Update] --> Channel3
+    end
+
+    subgraph "Git Isolation"
+        AuthBranch[wt/auth-refactor] --> AuthDir
+        LoginBranch[wt/ui-login] --> LoginDir
+        ApiBranch[wt/api-update] --> ApiDir
+    end
+
+    subgraph "Concurrent Execution"
+        Agent1[Agent 1] --> Channel1
+        Agent2[Agent 2] --> Channel2
+        Agent3[Agent 3] --> Channel3
+    end
+
+    Task1 --> Agent1
+    Task2 --> Agent2
+    Task3 --> Agent3
+```
+
+### Core Components Interaction
+
+```mermaid
+graph TB
+    subgraph "TaskManager Core"
+        TM[Task Manager] --> TF[Task Files]
+        TM --> TB[Task Board]
+        TM --> TMU[Task Mutex]
+    end
+
+    subgraph "WorktreeManager Core"
+        WM[Worktree Manager] --> WI[Worktree Index]
+        WM --> WMU[Worktree Mutex]
+        WM --> EL[Event Logger]
+    end
+
+    subgraph "Binding Operations"
+        Bind[Bind Worktree] --> LoadTask[Load Task]
+        Bind --> UpdateTask[Update Task]
+        Bind --> UpdateIndex[Update Index]
+        Unbind[Unbind Worktree] --> CompleteTask[Complete Task]
+    end
+
+    subgraph "Agent Integration"
+        Agent[Agent Loop] --> TaskTools[Task Tools]
+        Agent --> WorktreeTools[Worktree Tools]
+        TaskTools --> Create[Create Task]
+        WorktreeTools --> CreateWT[Create Worktree]
+        WorktreeTools --> RunWT[Run in Worktree]
+        WorktreeTools --> RemoveWT[Remove Worktree]
+    end
+
+    Create --> TM
+    CreateWT --> WM
+    Bind --> TM
+    Bind --> WM
+    Unbind --> TM
+    Unbind --> WM
+    EL --> WI
+    TMU --> LoadTask
+    WMU --> UpdateIndex
+```

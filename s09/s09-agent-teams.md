@@ -228,3 +228,305 @@ go run main.go
 3. `Check the lead inbox for any messages`
 4. 输入 `/team` 查看团队名册和状态
 5. 输入 `/inbox` 手动检查领导的收件箱
+
+## 业务流程图
+
+### 系统架构总览
+
+```mermaid
+graph TB
+    subgraph "Team Lead Loop"
+        User[User Input] --> LeadLoop[Lead Agent Loop]
+        LeadLoop --> LLMCall[LLM API Call]
+        LLMCall --> ToolExec[Tool Execution]
+        ToolExec --> LeadLoop
+    end
+
+    subgraph "Team Management"
+        TeamMgr[TeammateManager] --> Config[config.json]
+        TeamMgr --> Members[Team Members]
+        TeamMgr --> Mutex[Thread Safety]
+    end
+
+    subgraph "Message System"
+        MsgBus[MessageBus] --> Inboxes[JSONL Inboxes]
+        MsgBus --> Files[File System]
+        MsgBus --> MsgMutex[Thread Safety]
+    end
+
+    subgraph "Teammate Loops"
+        Alice[Alice Loop] --> MsgBus
+        Bob[Bob Loop] --> MsgBus
+        TeamLead[Team Lead Loop] --> MsgBus
+    end
+
+    ToolExec --> TeamMgr
+    ToolExec --> MsgBus
+    TeamMgr --> Alice
+    TeamMgr --> Bob
+```
+
+### 详细流程序列
+
+#### 1. 队友创建流程
+
+```mermaid
+sequenceDiagram
+    participant User as User
+    participant LeadLoop as Lead Loop
+    participant TeamMgr as TeammateManager
+    participant Config as config.json
+    participant Alice as Alice Loop
+    participant LLM as LLM
+
+    User->>LeadLoop: Request spawn teammate
+    LeadLoop->>LLM: Process request with spawn tool
+    LLM-->>LeadLoop: spawn tool call
+    LeadLoop->>TeamMgr: Spawn(name, role, prompt)
+    TeamMgr->>TeamMgr: Create teammate entry
+    TeamMgr->>Config: Save team config
+    Config-->>TeamMgr: Config saved
+    TeamMgr->>Alice: Start teammate loop in goroutine
+    Alice-->>LeadLoop: Spawn confirmation
+    LeadLoop-->>User: Display spawn result
+```
+
+#### 2. 消息通信流程
+
+```mermaid
+sequenceDiagram
+    participant Alice as Alice
+    participant Bob as Bob
+    participant MsgBus as MessageBus
+    participant Inbox as bob.jsonl
+    participant FileSystem as File System
+
+    Alice->>MsgBus: Send(sender, "bob", content)
+    MsgBus->>FileSystem: Open bob.jsonl for append
+    FileSystem-->>MsgBus: File handle
+    MsgBus->>FileSystem: Write JSON line
+    FileSystem-->>MsgBus: Write complete
+    MsgBus-->>Alice: Send confirmation
+
+    Note over Bob: Bob checks inbox periodically
+    Bob->>MsgBus: ReadInbox("bob")
+    MsgBus->>FileSystem: Read bob.jsonl
+    FileSystem-->>MsgBus: File content
+    MsgBus->>FileSystem: Clear bob.jsonl
+    FileSystem-->>MsgBus: File cleared
+    MsgBus-->>Bob: Messages array
+```
+
+#### 3. 队友生命周期流程
+
+```mermaid
+sequenceDiagram
+    participant TeamMgr as TeammateManager
+    participant Config as config.json
+    participant Teammate as Teammate Loop
+    participant LLM as LLM
+    participant Inbox as MessageBus
+
+    Note over Teammate: Initial spawn
+    TeamMgr->>Config: Add member with "working" status
+    TeamMgr->>Teammate: Start agent loop
+
+    loop Agent Loop (max 50 iterations)
+        Teammate->>Inbox: ReadInbox(name)
+        Inbox-->>Teammate: New messages
+        Teammate->>LLM: Chat completion with inbox context
+        LLM-->>Teammate: LLM response
+        Teammate->>Teammate: Execute tool calls
+    end
+
+    Note over Teammate: Loop completed
+    Teammate->>Config: Update status to "idle"
+    Config-->>TeamMgr: Status updated
+```
+
+#### 4. 团队配置管理流程
+
+```mermaid
+sequenceDiagram
+    participant User as User
+    participant LeadLoop as Lead Loop
+    participant TeamMgr as TeammateManager
+    participant Config as config.json
+    participant FileSystem as File System
+
+    User->>LeadLoop: Request team status
+    LeadLoop->>TeamMgr: Get team roster
+    TeamMgr->>FileSystem: Read config.json
+    FileSystem-->>TeamMgr: Config data
+    TeamMgr->>TeamMgr: Parse team members
+    TeamMgr-->>LeadLoop: Team roster
+    LeadLoop-->>User: Display team status
+
+    Note over TeamMgr: Team member status changes
+    TeamMgr->>Config: Update member status
+    Config->>FileSystem: Save config.json
+    FileSystem-->>Config: Save complete
+```
+
+### 关键状态转换
+
+```mermaid
+stateDiagram-v2
+    [*] --> working: spawn() called
+    working --> idle: Agent loop completes
+    idle --> working: New message received
+    working --> shutdown: shutdown_request received
+    idle --> shutdown: shutdown_request received
+    shutdown --> [*]: Process terminated
+
+    note right of working
+        Teammate is actively processing
+        Running agent loop
+        Executing LLM calls
+    end note
+
+    note right of idle
+        Teammate waiting for messages
+        Periodic inbox checks
+        Ready to reactivate
+    end note
+
+    note right of shutdown
+        Graceful termination
+        Resources cleaned up
+        Removed from team
+    end note
+```
+
+### 消息流架构
+
+```mermaid
+graph TB
+    subgraph "Message Types"
+        Direct[Direct Message]
+        Broadcast[Broadcast Message]
+        Shutdown[Shutdown Request]
+        Response[Plan Response]
+    end
+
+    subgraph "Message Processing"
+        Send[Send Operation]
+        Receive[Read Inbox]
+        Clear[Clear Inbox]
+        Format[JSON Format]
+    end
+
+    subgraph "Storage Layer"
+        AliceInbox[alice.jsonl]
+        BobInbox[bob.jsonl]
+        LeadInbox[lead.jsonl]
+        FileSystem[File System]
+    end
+
+    Direct --> Send
+    Broadcast --> Send
+    Shutdown --> Send
+    Response --> Send
+
+    Send --> Format
+    Format --> AliceInbox
+    Format --> BobInbox
+    Format --> LeadInbox
+
+    Receive --> AliceInbox
+    Receive --> BobInbox
+    Receive --> LeadInbox
+
+    Receive --> Clear
+    Clear --> FileSystem
+```
+
+### 团队协调架构
+
+```mermaid
+graph TB
+    subgraph "Leadership Layer"
+        Lead[Team Lead]
+        LeadMgr[Lead Manager]
+        LeadTools[Lead Tools]
+    end
+
+    subgraph "Teammate Layer"
+        Alice[Teammate Alice]
+        Bob[Teammate Bob]
+        Charlie[Teammate Charlie]
+        TeamLoops[Agent Loops]
+    end
+
+    subgraph "Communication Layer"
+        MsgBus[Message Bus]
+        Inboxes[Personal Inboxes]
+        Broadcasts[Broadcast Messages]
+    end
+
+    subgraph "Persistence Layer"
+        Config[Team Config]
+        MsgHistory[Message History]
+        StatusLogs[Status Logs]
+    end
+
+    Lead --> LeadMgr
+    LeadMgr --> LeadTools
+    LeadTools --> MsgBus
+
+    Alice --> TeamLoops
+    Bob --> TeamLoops
+    Charlie --> TeamLoops
+    TeamLoops --> Inboxes
+
+    MsgBus --> Inboxes
+    MsgBus --> Broadcasts
+    Inboxes --> MsgHistory
+    Broadcasts --> MsgHistory
+
+    LeadMgr --> Config
+    TeamLoops --> StatusLogs
+```
+
+### 核心组件交互
+
+```mermaid
+graph TB
+    subgraph "TeammateManager Core"
+        TM[TeammateManager] --> TC[Team Config]
+        TM --> MU[sync.Mutex]
+        TM --> ML[Member List]
+    end
+
+    subgraph "MessageBus Core"
+        MB[MessageBus] --> ID[Inbox Directory]
+        MB --> BM[Bus Mutex]
+        MB --> FM[File Management]
+    end
+
+    subgraph "Agent Operations"
+        Spawn[Spawn] --> Loop[Agent Loop]
+        Send[Send] --> Write[Write JSONL]
+        Read[Read Inbox] --> Clear[Clear File]
+        Update[Update Status] --> Save[Save Config]
+    end
+
+    subgraph "Team Integration"
+        TL[Team Lead] --> Tools[Team Tools]
+        Tools --> Spawn
+        Tools --> Send
+        Tools --> Read
+        Tools --> Update
+        Tools --> TL
+    end
+
+    MU --> Save
+    MU --> Loop
+    BM --> Write
+    BM --> Read
+    BM --> Clear
+    TC --> Save
+    ID --> Write
+    ID --> Read
+    ID --> Clear
+```

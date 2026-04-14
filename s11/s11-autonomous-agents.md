@@ -46,10 +46,13 @@ Identity re-injection after compression:
 ```
 
 ## 工作原理
+
 #### System Prompt
+
 ```
 You are a team lead at %s. Teammates are autonomous.
 ```
+
 1. 队友循环分两个阶段: WORK 和 IDLE。LLM 停止调用工具 (或调用了 `idle`) 时, 进入 IDLE。
 
 ```go
@@ -207,3 +210,311 @@ go run main.go
 3. `Create tasks with dependencies. Watch teammates respect the blocked order.`
 4. 输入 `/tasks` 查看带 owner 的任务看板
 5. 输入 `/team` 监控谁在工作、谁在空闲
+
+## Business Flow Diagram
+
+### Overall System Architecture
+
+```mermaid
+graph TB
+    subgraph "Team Lead Loop"
+        User[User Input] --> LeadLoop[Lead Agent Loop]
+        LeadLoop --> LLMCall[LLM API Call]
+        LLMCall --> ToolExec[Tool Execution]
+        ToolExec --> LeadLoop
+    end
+
+    subgraph "Autonomous Teammates"
+        Alice[Alice Autonomous Loop] --> TaskBoard[Task Board]
+        Bob[Bob Autonomous Loop] --> TaskBoard
+        Charlie[Charlie Autonomous Loop] --> TaskBoard
+    end
+
+    subgraph "Task Management"
+        TaskBoard --> TaskFiles[Task JSON Files]
+        TaskBoard --> Scanner[Task Scanner]
+        TaskBoard --> Claimer[Task Claimer]
+    end
+
+    subgraph "Idle Management"
+        IdlePoller[Idle Poller] --> InboxChecker[Inbox Checker]
+        IdlePoller --> TaskScanner[Task Scanner]
+        IdlePoller --> Timeout[Timeout Manager]
+    end
+
+    subgraph "Identity Management"
+        IdentityMgr[Identity Manager] --> ContextChecker[Context Checker]
+        IdentityMgr --> IdentityInjector[Identity Injector]
+    end
+
+    Alice --> IdlePoller
+    Bob --> IdlePoller
+    Charlie --> IdlePoller
+    IdlePoller --> TaskBoard
+    Alice --> IdentityMgr
+    Bob --> IdentityMgr
+    Charlie --> IdentityMgr
+```
+
+### Detailed Flow Sequences
+
+#### 1. Autonomous Agent Lifecycle Flow
+
+```mermaid
+sequenceDiagram
+    participant Lead as Lead Loop
+    participant Teammate as Autonomous Teammate
+    participant WorkPhase as Work Phase
+    participant IdlePhase as Idle Phase
+    participant TaskBoard as Task Board
+
+    Lead->>Teammate: spawn autonomous teammate
+    Teammate->>WorkPhase: Enter work phase
+
+    loop Work Phase (max 50 iterations)
+        WorkPhase->>WorkPhase: Check identity context
+        WorkPhase->>WorkPhase: LLM chat completion
+        WorkPhase->>WorkPhase: Execute tool calls
+        alt No more tool calls or idle tool called
+            WorkPhase->>IdlePhase: Enter idle phase
+            break
+        end
+    end
+
+    IdlePhase->>IdlePhase: Set status to idle
+    IdlePhase->>TaskBoard: Scan for unclaimed tasks
+    alt Task found
+        IdlePhase->>TaskBoard: Claim task
+        TaskBoard-->>IdlePhase: Task claimed
+        IdlePhase->>WorkPhase: Resume work phase
+    else No task found
+        IdlePhase->>IdlePhase: Check inbox
+        alt Message found
+            IdlePhase->>WorkPhase: Resume work phase
+        else Timeout reached
+            IdlePhase->>Teammate: Shutdown
+        end
+    end
+```
+
+#### 2. Task Auto-Claim Flow
+
+```mermaid
+sequenceDiagram
+    participant Teammate as Autonomous Teammate
+    participant Scanner as Task Scanner
+    participant TaskFiles as Task Files
+    participant Claimer as Task Claimer
+    participant FileSystem as File System
+
+    Teammate->>Scanner: scanUnclaimedTasks()
+    Scanner->>FileSystem: Glob task_*.json files
+    FileSystem-->>Scanner: File list
+    Scanner->>TaskFiles: Read each task file
+    TaskFiles-->>Scanner: Task data
+
+    loop Each task
+        Scanner->>Scanner: Check if pending + no owner + not blocked
+        alt Task is claimable
+            Scanner->>Claimer: claimTask(taskID, teammateName)
+            Claimer->>TaskFiles: Load task file
+            TaskFiles-->>Claimer: Task data
+            Claimer->>Claimer: Set owner and status to in_progress
+            Claimer->>FileSystem: Save updated task
+            FileSystem-->>Claimer: Task saved
+            Claimer-->>Teammate: Task claimed successfully
+            Scanner-->>Teammate: Return claimed task
+        end
+    end
+```
+
+#### 3. Identity Re-injection Flow
+
+```mermaid
+sequenceDiagram
+    participant Teammate as Autonomous Teammate
+    participant ContextMgr as Context Manager
+    participant IdentityMgr as Identity Manager
+    participant Messages as Message History
+
+    Teammate->>ContextMgr: Check message length
+    ContextMgr->>Messages: Count messages
+    Messages-->>ContextMgr: Message count
+
+    alt Message count <= 3 (context compressed)
+        ContextMgr->>IdentityMgr: Create identity block
+        IdentityMgr->>IdentityMgr: Generate identity: "You are 'name', role: role"
+        IdentityMgr->>Messages: Insert identity at position 0
+        IdentityMgr->>Messages: Insert acknowledgment at position 1
+        Messages-->>Teammate: Identity injected
+    else Message count > 3
+        ContextMgr-->>Teammate: No injection needed
+    end
+
+    Teammate->>Teammate: Continue with updated context
+```
+
+#### 4. Idle Polling Management Flow
+
+```mermaid
+sequenceDiagram
+    participant Teammate as Autonomous Teammate
+    participant IdleMgr as Idle Manager
+    participant InboxChecker as Inbox Checker
+    participant TaskScanner as Task Scanner
+    participant Timer as Timeout Timer
+
+    Teammate->>IdleMgr: Enter idle phase
+    IdleMgr->>Timer: Start 60s timeout
+
+    loop Poll every 5s (max 12 cycles)
+        IdleMgr->>InboxChecker: Check inbox for messages
+        InboxChecker-->>IdleMgr: Messages found?
+        alt Messages found
+            IdleMgr->>Teammate: Resume work phase
+        else No messages
+            IdleMgr->>TaskScanner: Scan for unclaimed tasks
+            TaskScanner-->>IdleMgr: Tasks found?
+            alt Tasks found
+                IdleMgr->>Teammate: Resume work phase
+            else No tasks
+                IdleMgr->>Timer: Check timeout
+                Timer-->>IdleMgr: Timeout reached?
+                alt Timeout reached
+                    IdleMgr->>Teammate: Initiate shutdown
+                else No timeout
+                    IdleMgr->>IdleMgr: Wait 5s
+                end
+            end
+        end
+    end
+```
+
+### Key State Transitions
+
+```mermaid
+stateDiagram-v2
+    [*] --> working: spawn() called
+    working --> idle: No tool calls or idle tool
+    idle --> working: Task claimed or message received
+    idle --> shutdown: 60s timeout
+    working --> shutdown: Critical error
+
+    note right of working
+        Active task execution
+        LLM tool calls
+        Context management
+    end note
+
+    note right of idle
+        Polling for work
+        Scanning task board
+        Checking inbox
+    end note
+
+    note right of shutdown
+        Graceful termination
+        Resource cleanup
+        Status updated
+    end note
+```
+
+### Autonomous Task Management Architecture
+
+```mermaid
+graph TB
+    subgraph "Autonomous Layer"
+        AgentLoop[Agent Loop] --> WorkPhase[Work Phase]
+        AgentLoop --> IdlePhase[Idle Phase]
+        AgentLoop --> IdentityMgr[Identity Manager]
+    end
+
+    subgraph "Task Discovery"
+        TaskScanner[Task Scanner] --> TaskFilter[Task Filter]
+        TaskFilter --> TaskClaimer[Task Claimer]
+        TaskClaimer --> TaskUpdater[Task Updater]
+    end
+
+    subgraph "Communication"
+        InboxChecker[Inbox Checker] --> MessageProcessor[Message Processor]
+        MessageProcessor --> ContextInjector[Context Injector]
+    end
+
+    subgraph "Persistence"
+        TaskFiles[Task Files] --> FileSystem[File System]
+        WorktreeRegistry[Worktree Registry] --> FileSystem
+    end
+
+    IdlePhase --> TaskScanner
+    IdlePhase --> InboxChecker
+    WorkPhase --> IdentityMgr
+    TaskClaimer --> TaskUpdater
+    TaskUpdater --> TaskFiles
+    MessageProcessor --> ContextInjector
+```
+
+### Self-Organization Architecture
+
+```mermaid
+graph TB
+    subgraph "Self-Organization Engine"
+        AutoDiscovery[Auto Discovery] --> SelfSelection[Self Selection]
+        SelfSelection --> AutoClaim[Auto Claim]
+        AutoClaim --> SelfCoordination[Self Coordination]
+    end
+
+    subgraph "Task Board Interface"
+        TaskScanner[Task Scanner] --> TaskMatcher[Task Matcher]
+        TaskMatcher --> DependencyChecker[Dependency Checker]
+        DependencyChecker --> ClaimValidator[Claim Validator]
+    end
+
+    subgraph "Agent Behavior"
+        AutonomousAgent[Autonomous Agent] --> IdleBehavior[Idle Behavior]
+        IdleBehavior --> PollingBehavior[Polling Behavior]
+        PollingBehavior --> ClaimingBehavior[Claiming Behavior]
+        ClaimingBehavior --> WorkBehavior[Work Behavior]
+    end
+
+    SelfDiscovery --> TaskScanner
+    AutoClaim --> ClaimValidator
+    SelfCoordination --> AutonomousAgent
+    AutonomousAgent --> IdleBehavior
+```
+
+### Core Components Interaction
+
+```mermaid
+graph TB
+    subgraph "AutonomousLoop Core"
+        AL[Autonomous Loop] --> WP[Work Phase]
+        AL --> IP[Idle Phase]
+        AL --> IM[Identity Manager]
+    end
+
+    subgraph "TaskManagement Core"
+        TS[Task Scanner] --> TC[Task Claimer]
+        TS --> TF[Task Filter]
+        TC --> TU[Task Updater]
+    end
+
+    subgraph "IdleManagement Core"
+        IP[Idle Phase] --> IC[Inbox Checker]
+        IP --> TP[Task Poller]
+        IP --> TM[Timeout Manager]
+    end
+
+    subgraph "Agent Integration"
+        Agent[Autonomous Agent] --> AutoTools[Autonomous Tools]
+        AutoTools --> idle[idle]
+        AutoTools --> claim_task[claim_task]
+        AutoTools --> Agent
+    end
+
+    WP --> IM
+    IP --> TS
+    IC --> Agent
+    TP --> TC
+    TM --> Agent
+    TU --> Agent
+```

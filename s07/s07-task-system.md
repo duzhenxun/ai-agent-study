@@ -237,3 +237,268 @@ go run main.go
 2. `List all tasks and show the dependency graph`
 3. `Complete task 1 and then list tasks to see task 2 unblocked`
 4. `Create a task board for refactoring: parse -> transform -> emit -> test, where transform and emit can run in parallel after parse`
+
+## 业务流程图
+
+### 系统架构总览
+
+```mermaid
+graph TB
+    subgraph "Agent Loop"
+        User[User Input] --> AgentLoop[Agent Loop]
+        AgentLoop --> LLMCall[LLM API Call]
+        LLMCall --> ToolExec[Tool Execution]
+        ToolExec --> AgentLoop
+    end
+
+    subgraph "Task Management"
+        TaskMgr[TaskManager] --> TaskFiles[Task JSON Files]
+        TaskMgr --> TaskMap[Task Map in Memory]
+        TaskMgr --> Mutex[Thread Safety]
+    end
+
+    subgraph "Task Tools"
+        TaskCreate[task_create] --> TaskMgr
+        TaskUpdate[task_update] --> TaskMgr
+        TaskList[task_list] --> TaskMgr
+        TaskGet[task_get] --> TaskMgr
+    end
+
+    ToolExec --> TaskCreate
+    ToolExec --> TaskUpdate
+    ToolExec --> TaskList
+    ToolExec --> TaskGet
+    TaskMgr --> TaskFiles
+```
+
+### 详细流程序列
+
+#### 1. 任务创建流程
+
+```mermaid
+sequenceDiagram
+    participant User as User
+    participant AgentLoop as Agent Loop
+    participant TaskMgr as TaskManager
+    participant FileSystem as File System
+    participant LLM as LLM
+
+    User->>AgentLoop: Request task creation
+    AgentLoop->>LLM: Process request with task tools
+    LLM-->>AgentLoop: task_create tool call
+    AgentLoop->>TaskMgr: Create task(subject, description)
+    TaskMgr->>TaskMgr: Generate unique ID
+    TaskMgr->>TaskMgr: Create Task struct with "pending" status
+    TaskMgr->>FileSystem: Save task_*.json file
+    FileSystem-->>TaskMgr: File saved
+    TaskMgr-->>AgentLoop: Return created task
+    AgentLoop-->>User: Display task details
+```
+
+#### 2. 任务更新流程
+
+```mermaid
+sequenceDiagram
+    participant User as User
+    participant AgentLoop as Agent Loop
+    participant TaskMgr as TaskManager
+    participant FileSystem as File System
+    participant LLM as LLM
+
+    User->>AgentLoop: Request task update
+    AgentLoop->>LLM: Process request with task tools
+    LLM-->>AgentLoop: task_update tool call
+    AgentLoop->>TaskMgr: Update task(taskID, status, dependencies)
+    TaskMgr->>FileSystem: Load task_*.json file
+    FileSystem-->>TaskMgr: Task data loaded
+
+    alt Status change to "completed"
+        TaskMgr->>TaskMgr: Clear dependencies from other tasks
+        TaskMgr->>FileSystem: Update dependent tasks
+        FileSystem-->>TaskMgr: Dependencies cleared
+    end
+
+    TaskMgr->>TaskMgr: Update task status and dependencies
+    TaskMgr->>FileSystem: Save updated task_*.json
+    FileSystem-->>TaskMgr: File saved
+    TaskMgr-->>AgentLoop: Return updated task
+    AgentLoop-->>User: Display updated task
+```
+
+#### 3. 任务依赖管理流程
+
+```mermaid
+sequenceDiagram
+    participant TaskMgr as TaskManager
+    participant TaskA as Task A
+    participant TaskB as Task B
+    participant FileSystem as File System
+
+    TaskMgr->>TaskA: Update with blocks=[B]
+    TaskMgr->>TaskB: Update with blockedBy=[A]
+    TaskMgr->>FileSystem: Save both tasks
+
+    Note over TaskMgr: Task A blocks Task B
+
+    TaskMgr->>TaskA: Update status to "completed"
+    TaskMgr->>TaskMgr: clearDependency(A)
+    TaskMgr->>FileSystem: Load all tasks
+    FileSystem-->>TaskMgr: All task files
+
+    loop Each task
+        TaskMgr->>TaskMgr: Remove A from blockedBy
+        TaskMgr->>FileSystem: Save updated task
+    end
+
+    Note over TaskMgr: Task B is now unblocked
+```
+
+#### 4. 任务列表和查询流程
+
+```mermaid
+sequenceDiagram
+    participant User as User
+    participant AgentLoop as Agent Loop
+    participant TaskMgr as TaskManager
+    participant FileSystem as File System
+
+    User->>AgentLoop: Request task list/query
+    AgentLoop->>TaskMgr: ListAll() or Get(taskID)
+
+    alt List all tasks
+        TaskMgr->>FileSystem: Load all task_*.json files
+        FileSystem-->>TaskMgr: All task data
+        TaskMgr->>TaskMgr: Sort by ID and format list
+        TaskMgr-->>AgentLoop: Formatted task list
+    else Get specific task
+        TaskMgr->>FileSystem: Load specific task_*.json
+        FileSystem-->>TaskMgr: Task data
+        TaskMgr-->>AgentLoop: Task details
+    end
+
+    AgentLoop-->>User: Display task information
+```
+
+### 关键状态转换
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: task_create()
+    pending --> in_progress: task_update(status="in_progress")
+    in_progress --> completed: task_update(status="completed")
+    in_progress --> pending: task_update(status="pending")
+    completed --> [*]: Task archived
+
+    note right of pending
+        Task is ready to work
+        No blocking dependencies
+    end note
+
+    note right of in_progress
+        Task is being worked on
+        Resources allocated
+    end note
+
+    note right of completed
+        Task finished successfully
+        Dependencies cleared
+    end note
+```
+
+### 依赖图架构
+
+```mermaid
+graph TB
+    subgraph "Task Dependencies"
+        Task1[Task 1 completed]
+        Task2[Task 2 pending]
+        Task3[Task 3 pending]
+        Task4[Task 4 blocked]
+
+        Task1 --> Task2
+        Task1 --> Task3
+        Task2 --> Task4
+        Task3 --> Task4
+    end
+
+    subgraph "Dependency Relationships"
+        Blocks1[blocks 2,3]
+        BlockedBy2[blockedBy 1]
+        BlockedBy3[blockedBy 1]
+        Blocks2[blocks 4]
+        Blocks3[blocks 4]
+        BlockedBy4[blockedBy 2,3]
+    end
+
+    Task1 -.-> Blocks1
+    Task2 -.-> BlockedBy2
+    Task2 -.-> Blocks2
+    Task3 -.-> BlockedBy3
+    Task3 -.-> Blocks3
+    Task4 -.-> BlockedBy4
+```
+
+### 数据流架构
+
+```mermaid
+graph LR
+    subgraph "Input Flow"
+        A[User Command] --> B{Task Tool Type}
+        B -->|task_create| C[Create Task]
+        B -->|task_update| D[Update Task]
+        B -->|task_list| E[List Tasks]
+        B -->|task_get| F[Get Task]
+    end
+
+    subgraph "Task Processing"
+        C --> G[Generate ID]
+        G --> H[Validate Data]
+        H --> I[Update Dependencies]
+        I --> J[File Operations]
+        D --> H
+        E --> K[Load All Files]
+        F --> L[Load Single File]
+        K --> M[Format Output]
+        L --> M
+    end
+
+    subgraph "Output Flow"
+        J --> N[Save JSON Files]
+        M --> O[Return Task Data]
+        N --> O
+        O --> P[User Response]
+    end
+```
+
+### 核心组件交互
+
+```mermaid
+graph TB
+    subgraph "TaskManager Core"
+        TM[TaskManager] --> TF[Task Files]
+        TM --> MU[sync.Mutex]
+        TM --> ID[Next ID Generator]
+    end
+
+    subgraph "Task Operations"
+        Create[Create] --> Load[Load]
+        Update[Update] --> Load
+        List[ListAll] --> Load
+        Get[Get] --> Load
+        Load --> Save[Save]
+        Save --> TF
+    end
+
+    subgraph "Agent Integration"
+        AL[Agent Loop] --> Tools[Task Tools]
+        Tools --> Create
+        Tools --> Update
+        Tools --> List
+        Tools --> Get
+        Tools --> AL
+    end
+
+    MU --> Load
+    MU --> Save
+    ID --> Create
+```
