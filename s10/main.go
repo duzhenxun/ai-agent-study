@@ -101,66 +101,66 @@ var (
 // This function reads environment variables from the project root .env file and sets them in the system
 // Only sets environment variables when they don't exist, avoiding overwriting existing system variables
 func loadEnv() error {
-	// Get current working directory
+	// 获取当前工作目录
 	workdir, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("failed to get working directory: %w", err)
 	}
 
-	// Search upward for project root directory (containing .env file)
+	// 向上查找项目根目录（包含 .env 文件的目录）
 	projectRoot := workdir
 	for {
 		envPath := filepath.Join(projectRoot, ".env")
 		if _, err := os.Stat(envPath); err == nil {
-			// Found .env file, use current directory
+			// 找到 .env 文件
 			break
 		}
 
-		// Move up to parent directory
+		// 向上一级目录查找
 		parent := filepath.Dir(projectRoot)
 		if parent == projectRoot {
-			// Already reached root directory, stop searching
+			// 已经到达根目录，停止查找
 			break
 		}
 		projectRoot = parent
 	}
 
-	// Build .env file path
+	// 构建 .env 文件路径
 	envPath := filepath.Join(projectRoot, ".env")
 
-	// Check if .env file exists
+	// 检查 .env 文件是否存在
 	if _, err := os.Stat(envPath); os.IsNotExist(err) {
 		fmt.Printf("Warning: .env file not found at %s, using system environment variables only\n", envPath)
 		return nil
 	}
 
-	// Open and read .env file
+	// 打开并读取 .env 文件
 	file, err := os.Open(envPath)
 	if err != nil {
 		return fmt.Errorf("failed to open .env file: %w", err)
 	}
 	defer file.Close()
 
-	// Read .env file line by line
+	// 逐行读取 .env 文件
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 
-		// Skip empty lines and comment lines (starting with #)
+		// 跳过空行和注释行
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 
-		// Parse key-value pairs (format: KEY=VALUE)
+		// 解析 KEY=VALUE 格式
 		if parts := strings.SplitN(line, "=", 2); len(parts) == 2 {
 			key := strings.TrimSpace(parts[0])
 			value := strings.TrimSpace(parts[1])
 
-			// Remove possible quotes and backticks
+			// 移除可能存在的引号和反引号
 			value = strings.Trim(value, "\"'`")
 			value = strings.TrimSpace(value)
 
-			// Only set environment variable when it doesn't exist
+			// 只有当环境变量不存在时才设置
 			if os.Getenv(key) == "" {
 				os.Setenv(key, value)
 			}
@@ -171,7 +171,7 @@ func loadEnv() error {
 		return fmt.Errorf("error reading .env file: %w", err)
 	}
 
-	fmt.Printf("Loaded environment variables from .env file\n")
+	fmt.Printf("Loaded environment variables from .env file: %s\n", envPath)
 	return nil
 }
 
@@ -625,19 +625,18 @@ var toolHandlers = map[string]interface{}{
 }
 
 func agentLoop(messages *[]Message) {
-	// Add system message if not present
-	if len(*messages) == 0 {
-		*messages = append(*messages, Message{Role: "system", Content: system})
-	}
+	// 确保 system 提示词在最前面
+	allMessages := append([]Message{{Role: "system", Content: system}}, *messages...)
 
 	for {
-		msg, err := chatCompletionsCreate(*messages, leadTools())
+		msg, err := chatCompletionsCreate(allMessages, leadTools())
 		if err != nil {
 			log.Printf("Error calling API: %v", err)
 			return
 		}
 
 		*messages = append(*messages, msg)
+		allMessages = append(allMessages, msg)
 
 		if len(msg.ToolCalls) == 0 {
 			if msg.Content != "" {
@@ -665,11 +664,13 @@ func agentLoop(messages *[]Message) {
 				fmt.Printf(">✌️ 执行命令:%s \n ✌️ 参数:%+v \n ✌️ 结果:%s ✌️\n\n\n", name, args, output)
 			}
 
-			*messages = append(*messages, Message{
+			toolMsg := Message{
 				Role:       "tool",
 				ToolCallID: tc.ID,
 				Content:    output,
-			})
+			}
+			*messages = append(*messages, toolMsg)
+			allMessages = append(allMessages, toolMsg)
 		}
 	}
 }
